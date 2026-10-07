@@ -117,9 +117,10 @@ editor and cloud integrations.
 The full existing test command was attempted: 1,511 tests passed, 19 failed,
 and four skipped. Failures include missing Electron/native bindings. Earlier
 browser launch attempts were blocked by process sandbox permissions. With
-authorized process access, eight local Chromium/WebKit checks now pass: native
-fixture rendering, actual InlineEditor keyboard input, peer updates, undo/redo,
-IndexedDB save/reload, retained structured data and mobile layout. Local Firefox
+authorized process access, ten local Chromium/WebKit checks now pass: native
+fixture rendering, actual InlineEditor keyboard input, peer updates, undo/redo
+including keyboard shortcuts, emoji/multiline insertion and deletion, IndexedDB
+save/reload, retained structured data and mobile layout. Local Firefox
 stalled at launch and was interrupted; fork CI covers all three browsers.
 
 The original storage-sync tests (15) and focused BlockSuite block/document/

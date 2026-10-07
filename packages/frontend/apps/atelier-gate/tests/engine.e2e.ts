@@ -59,6 +59,11 @@ test('actual BlockSuite inline editor handles browser input backed by Automerge 
   await expect(editor).toHaveText('Hello Atelier!');
   await page.getByRole('button', { name: 'Synchronize replicas' }).click();
   await expect(page.getByTestId('text-B')).toHaveText('Hello Atelier!');
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+z');
+  await expect(editor).toHaveText('Hello Atelier');
+  await page.keyboard.press('ControlOrMeta+Shift+z');
+  await expect(editor).toHaveText('Hello Atelier!');
   await page.getByRole('button', { name: 'Undo A', exact: true }).click();
   await expect(editor).toHaveText('Hello Atelier');
   await page.getByRole('button', { name: 'Redo A', exact: true }).click();
@@ -69,6 +74,46 @@ test('actual BlockSuite inline editor handles browser input backed by Automerge 
   await page.getByRole('button', { name: 'Restore checkpoint' }).click();
   await expect(page.getByTestId('text-A')).toHaveText('Hello Atelier!');
   await expect(page.getByTestId('text-A').locator('v-line')).toHaveCount(1);
+});
+
+test('BlockSuite keyboard input retains emoji and multiline text through sync and deletion', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const editor = page.getByRole('textbox', { name: 'BlockSuite text A' });
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+End');
+  await page.keyboard.insertText('🙂');
+  await page.keyboard.press('Enter');
+  await page.keyboard.insertText('Second');
+  await page.getByRole('button', { name: 'Synchronize replicas' }).click();
+  const readText = async (replica: string) => {
+    const snapshot = JSON.parse(
+      (await page.getByTestId(`snapshot-${replica}`).textContent())!
+    );
+    return snapshot.blocks.paragraph.props.text.delta
+      .map((span: { insert: string }) => span.insert)
+      .join('');
+  };
+  expect(await readText('A')).toBe('Hello Atelier🙂\nSecond');
+  expect(await readText('B')).toBe('Hello Atelier🙂\nSecond');
+  await editor.click();
+  await editor.evaluate(async element => {
+    const inlineEditor = (
+      element as HTMLElement & {
+        inlineEditor: { focusEnd(): void; waitForUpdate(): Promise<void> };
+      }
+    ).inlineEditor;
+    inlineEditor.focusEnd();
+    await inlineEditor.waitForUpdate();
+  });
+  await page.keyboard.press('Backspace');
+  await page.getByRole('button', { name: 'Synchronize replicas' }).click();
+  expect(await readText('A')).toBe('Hello Atelier🙂\nSecon');
+  expect(await readText('B')).toBe('Hello Atelier🙂\nSecon');
+  await page.getByRole('button', { name: 'Undo A', exact: true }).click();
+  await page.getByRole('button', { name: 'Synchronize replicas' }).click();
+  expect(await readText('B')).toBe('Hello Atelier🙂\nSecond');
 });
 
 test('IndexedDB acknowledges save after commit and restores retained structured data after reload', async ({

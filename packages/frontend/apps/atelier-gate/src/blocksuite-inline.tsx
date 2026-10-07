@@ -29,14 +29,48 @@ export function BlockSuiteInline({
   useEffect(() => {
     const element = root.current;
     if (!element) return;
-    const editor = new InlineEditor(new AutomergeTextAdapter(host, path));
+    const backend = new AutomergeTextAdapter(host, path);
+    const editor = new InlineEditor(backend);
+    const historyShortcut = (event: KeyboardEvent) => {
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        event.altKey ||
+        event.isComposing
+      )
+        return;
+      const key = event.key.toLowerCase();
+      if (key !== 'z' && key !== 'y') return;
+      event.preventDefault();
+      try {
+        const range = editor.getInlineRange();
+        const start = range ? backend.createAnchor(range.index) : null;
+        const end = range
+          ? backend.createAnchor(range.index + range.length)
+          : null;
+        if (key === 'y' || event.shiftKey) host.redo();
+        else host.undo();
+        if (start !== null && end !== null) {
+          const index = backend.resolveAnchor(start);
+          const last = backend.resolveAnchor(end);
+          if (index !== null && last !== null)
+            editor.setInlineRange({ index, length: Math.max(0, last - index) });
+        }
+        setError('');
+      } catch (failure) {
+        setError(String(failure));
+      }
+    };
     try {
       editor.mount(element);
+      element.addEventListener('keydown', historyShortcut);
       setError('');
     } catch (failure) {
       setError(String(failure));
     }
-    return () => editor.unmount();
+    return () => {
+      element.removeEventListener('keydown', historyShortcut);
+      editor.unmount();
+    };
   }, [host]);
   return (
     <>
