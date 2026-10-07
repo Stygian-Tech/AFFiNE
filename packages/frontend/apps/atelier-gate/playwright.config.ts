@@ -16,6 +16,6 @@ export default defineConfig({
   webServer: {
     command: 'yarn dev --port 4173',
     url: 'http://127.0.0.1:4173',
-    reuseExistingServer: false,
+    reuseExistingServer: process.env.ATELIER_REUSE_SERVER === '1',
   },
 });

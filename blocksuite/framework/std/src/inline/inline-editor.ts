@@ -1,6 +1,7 @@
 import { DisposableGroup } from '@blocksuite/global/disposable';
 import { BlockSuiteError, ErrorCode } from '@blocksuite/global/exceptions';
 import type { BaseTextAttributes, DeltaInsert } from '@blocksuite/store';
+import type { RichTextAdapter } from '@blocksuite/store/engine';
 import { type Signal, signal } from '@preact/signals-core';
 import { nothing, render, type TemplateResult } from 'lit';
 import { Subject } from 'rxjs';
@@ -17,6 +18,7 @@ import {
 } from './services/index.js';
 import { RenderService } from './services/render.js';
 import { InlineTextService } from './services/text.js';
+import { asRichTextAdapter, YjsRichTextAdapter } from './text-adapter.js';
 import type { InlineRange } from './types.js';
 import { nativePointToTextPoint, textPointToDomPoint } from './utils/index.js';
 import { getTextNodesFromElement } from './utils/text.js';
@@ -176,21 +178,30 @@ export class InlineEditor<
 
   readonly vLineRenderer: ((vLine: VLine) => TemplateResult) | null;
 
-  readonly yText: Y.Text;
+  readonly textBackend: RichTextAdapter;
+  /** Compatibility accessor for existing Yjs consumers. Neutral services use textBackend. */
+  get yText(): Y.Text {
+    if (this.textBackend instanceof YjsRichTextAdapter)
+      return this.textBackend.yText;
+    throw new BlockSuiteError(
+      ErrorCode.InlineEditorError,
+      'This editor uses an engine-neutral text backend; no Y.Text exists'
+    );
+  }
   get yTextDeltas() {
-    return this.yText.toDelta();
+    return this.textBackend.toDelta() as DeltaInsert<TextAttributes>[];
   }
   get yTextLength() {
-    return this.yText.length;
+    return this.textBackend.length;
   }
   get yTextString() {
-    return this.yText.toString();
+    return this.textBackend.toString();
   }
 
   readonly isEmbed: (delta: DeltaInsert<TextAttributes>) => boolean;
 
   constructor(
-    yText: InlineEditor['yText'],
+    yText: Y.Text | RichTextAdapter,
     ops: {
       isEmbed?: (delta: DeltaInsert<TextAttributes>) => boolean;
       hooks?: InlineHookService<TextAttributes>['hooks'];
@@ -198,12 +209,7 @@ export class InlineEditor<
       vLineRenderer?: (vLine: VLine) => TemplateResult;
     } = {}
   ) {
-    if (!yText.doc) {
-      throw new BlockSuiteError(
-        ErrorCode.InlineEditorError,
-        'yText must be attached to a Y.Doc'
-      );
-    }
+    const backend = asRichTextAdapter(yText);
 
     if (yText.toString().includes('\r')) {
       throw new BlockSuiteError(
@@ -219,7 +225,7 @@ export class InlineEditor<
       vLineRenderer = null,
     } = ops;
     this._inlineRangeProviderOverride = false;
-    this.yText = yText;
+    this.textBackend = backend;
     this.isEmbed = isEmbed;
     this.vLineRenderer = vLineRenderer;
     this.hooksService = new InlineHookService(this, hooks);
@@ -283,14 +289,6 @@ export class InlineEditor<
    * @param withoutTransact Execute a transaction without capturing the history.
    */
   transact(fn: () => void, withoutTransact = false): void {
-    const doc = this.yText.doc;
-    if (!doc) {
-      throw new BlockSuiteError(
-        ErrorCode.InlineEditorError,
-        'yText is not attached to a doc'
-      );
-    }
-
-    doc.transact(fn, withoutTransact ? null : doc.clientID);
+    this.textBackend.transact(fn, withoutTransact);
   }
 }

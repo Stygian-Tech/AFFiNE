@@ -4,5 +4,6 @@ export * from './extensions';
 export * from './inline-editor';
 export * from './range';
 export * from './services';
+export * from './text-adapter';
 export * from './types';
 export * from './utils';

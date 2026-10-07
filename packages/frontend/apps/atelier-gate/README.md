@@ -1,6 +1,6 @@
 # Structured document compatibility harness
 
-This React 19 web harness loads the real Rust/WASM document engine. It exercises two independent Automerge replicas, rich text and canvas model changes, selective undo, convergence, and IndexedDB checkpoint restoration. Peer exchange is explicit in-process checkpoint transfer. It is not iroh transport or a production editor.
+This React 19 web workbench mounts the **actual BlockSuite InlineEditor** against an Automerge text adapter and authoritative Rust/WASM document host. It exercises two independent replicas, native text editing and formatting, canvas model changes, selective undo/redo, Automerge sync messages, and IndexedDB checkpoint restoration. Peer exchange is explicit in-process protocol exchange. It is not iroh transport or the full AFFiNE editor.
 
 The full BlockSuite editor gate is **NOT PASSED**. These concrete interfaces currently prevent substituting this engine:
 
@@ -9,7 +9,7 @@ The full BlockSuite editor gate is **NOT PASSED**. These concrete interfaces cur
 - `blocksuite/framework/store/src/extension/history/history-extension.ts` constructs `Y.UndoManager` from document Yjs state.
 - `packages/frontend/core/src/blocksuite/block-suite-editor/blocksuite-editor.tsx` accepts a concrete BlockSuite `Store`, not an engine-neutral document.
 
-Rendering this harness's rich text and SVG does not prove AFFiNE editor fidelity, input handling, database editing, canvas tools, remote selections, or live editor undo. Login, PDS persistence, and iroh integration remain gated by that compatibility work.
+The inline editor uses BlockSuite's real rendering, input, selection, and event services; it does not maintain a live Yjs mirror. The SVG remains a model preview, not BlockSuite's canvas editor. Full block/database/canvas fidelity, clipboard/IME, remote selection, and original Store integration remain pending. Login, PDS persistence, and iroh integration remain gated by that compatibility work.
 
 ## Run
 
@@ -19,13 +19,13 @@ First build the WASM package using `packages/common/atelier-document` instructio
 
 The fixture follows BlockSuite's public `DocSnapshot` and nested `BlockSnapshot` shapes from `blocksuite/framework/store/src/transformer/type.ts` and preserves:
 
-| Data                                        | Model coverage                     | Actual editor coverage |
-| ------------------------------------------- | ---------------------------------- | ---------------------- |
-| Page/note/paragraph identities and children | Import, checkpoint, merge          | Pending                |
-| Delta rich text and bold mark               | Native text edit and mark          | Pending                |
-| Surface shape/connector properties          | Nested property edits              | Pending                |
-| Database columns, cells, views              | Snapshot retention                 | Pending                |
-| Image attachment references                 | Snapshot retention                 | Pending                |
-| Selective undo                              | Local operation after remote merge | Pending                |
+| Data                                        | Model coverage                     | Actual editor coverage                          |
+| ------------------------------------------- | ---------------------------------- | ----------------------------------------------- |
+| Page/note/paragraph identities and children | Import, checkpoint, merge          | Pending                                         |
+| Delta rich text and bold mark               | Native text edit and mark          | Real InlineEditor mounted; browser input suites |
+| Surface shape/connector properties          | Nested property edits              | Pending                                         |
+| Database columns, cells, views              | Snapshot retention                 | Pending                                         |
+| Image attachment references                 | Snapshot retention                 | Pending                                         |
+| Selective undo/redo                         | Local operation after remote merge | Workbench controls; full Store history pending  |
 
 The browser tests assert persisted state and rendered values; they do not declare the full editor compatibility gate passed.

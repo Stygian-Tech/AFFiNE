@@ -4,10 +4,15 @@ import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { exportBlockSuiteSnapshot } from '../../../../../blocksuite/framework/store/src/adapter/engine/snapshot';
-import type { StructuredDocument } from '../../../../../blocksuite/framework/store/src/adapter/engine/types';
+import type {
+  StructuredCommand,
+  StructuredDocument,
+} from '../../../../../blocksuite/framework/store/src/adapter/engine/types';
+import { WasmDocumentHost } from '../../../../../blocksuite/framework/store/src/adapter/engine/wasm-host';
 import init, {
   DocumentEngine,
 } from '../../../../common/atelier-document/pkg/atelier_document.js';
+import { BlockSuiteInline } from './blocksuite-inline';
 import { loadCheckpoint, storeCheckpoint } from './checkpoints';
 import { importedFixture, sourceFixture } from './fixture';
 
@@ -33,21 +38,30 @@ const initialFidelity =
   canonical(sourceFixture);
 seed.free();
 
-function read(engine: DocumentEngine): StructuredDocument {
-  return JSON.parse(engine.snapshot()) as StructuredDocument;
+function read(engine: WasmDocumentHost): StructuredDocument {
+  return engine.read();
 }
 
-function replicas(bytes: Uint8Array): DocumentEngine[] {
-  const left = DocumentEngine.load(bytes, crypto.randomUUID());
+function replicas(bytes: Uint8Array): WasmDocumentHost[] {
+  const load = () => {
+    const engine = DocumentEngine.load(bytes, crypto.randomUUID());
+    try {
+      return new WasmDocumentHost(engine, DocumentEngine);
+    } catch (failure) {
+      engine.free();
+      throw failure;
+    }
+  };
+  const left = load();
   try {
-    return [left, DocumentEngine.load(bytes, crypto.randomUUID())];
+    return [left, load()];
   } catch (failure) {
-    left.free();
+    left.dispose();
     throw failure;
   }
 }
 
-function exchange(left: DocumentEngine, right: DocumentEngine) {
+function exchange(left: WasmDocumentHost, right: WasmDocumentHost) {
   for (let round = 0; round < 20; round++) {
     const a = left.generateSyncMessage('right');
     const b = right.generateSyncMessage('left');
@@ -60,8 +74,14 @@ function exchange(left: DocumentEngine, right: DocumentEngine) {
 
 function App() {
   const [engines, setEngines] = useState(() => replicas(checkpoint));
-  useEffect(() => () => engines.forEach(engine => engine.free()), [engines]);
+  useEffect(() => () => engines.forEach(engine => engine.dispose()), [engines]);
   const [, setRevision] = useState(0);
+  useEffect(() => {
+    const unsubscribe = engines.map(engine =>
+      engine.observe(() => setRevision(n => n + 1))
+    );
+    return () => unsubscribe.forEach(dispose => dispose());
+  }, [engines]);
   const [status, setStatus] = useState(
     'Imported BlockSuite fixture into native Automerge state.'
   );
@@ -74,11 +94,11 @@ function App() {
     (async () => {
       try {
         await operation();
-        setRevision(n => n + 1);
         setStatus(message);
       } catch (failure) {
         setError(String(failure));
       } finally {
+        setRevision(n => n + 1);
         setBusy(false);
       }
     })().catch(failure => {
@@ -86,17 +106,18 @@ function App() {
       setBusy(false);
     });
   };
-  const command = (index: number, value: unknown, message: string) =>
-    run(() => engines[index].applyCommand(JSON.stringify(value)), message);
+  const command = (index: number, value: StructuredCommand, message: string) =>
+    run(() => engines[index].transact([value]), message);
   return (
     <main>
       <span>ATELIER NOTES · COMPATIBILITY WORKBENCH</span>
       <h1>Structured document engine</h1>
       <p className="notice">
         <strong>BlockSuite editor gate: NOT PASSED.</strong> This is a React
-        model harness using Rust/WASM Automerge. The original AFFiNE editor
-        still requires Yjs-backed Store, Text, and history interfaces. Browser
-        iroh, OAuth, and PDS integration are pending that gate.
+        workbench with the real BlockSuite inline text editor using Rust/WASM
+        Automerge. The full AFFiNE block and canvas editors still require
+        Yjs-backed Store and canvas interfaces. Browser iroh, OAuth, and PDS
+        integration are pending that gate.
       </p>
       <p data-testid="fixture-fidelity">
         Fixture fidelity: {initialFidelity ? 'passed' : 'FAILED'}
@@ -117,7 +138,7 @@ function App() {
           disabled={busy}
           onClick={() =>
             run(
-              () => storeCheckpoint(engines[0].save()),
+              () => storeCheckpoint(engines[0].checkpoint()),
               'Saved locally to IndexedDB; no PDS upload performed.'
             )
           }
@@ -174,18 +195,7 @@ function App() {
               aria-label={`Replica ${label}`}
             >
               <h2>Replica {label}</h2>
-              <div className="richtext" data-testid={`text-${label}`}>
-                {text.delta.map((span, i) => (
-                  <span
-                    key={i}
-                    style={{
-                      fontWeight: span.attributes?.bold ? 'bold' : undefined,
-                    }}
-                  >
-                    {span.insert}
-                  </span>
-                ))}
-              </div>
+              <BlockSuiteInline host={engines[index]} label={label} />
               <svg
                 viewBox="0 0 320 160"
                 role="img"
@@ -286,6 +296,17 @@ function App() {
                   }
                 >
                   Undo {label}
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    run(() => {
+                      if (!engines[index].redo())
+                        throw new Error('No local redo operation remains.');
+                    }, `Replica ${label} redid its last local operation.`)
+                  }
+                >
+                  Redo {label}
                 </button>
               </div>
               <details>

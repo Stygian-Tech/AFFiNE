@@ -34,6 +34,7 @@ export interface BlockSuiteDocumentSnapshot {
 
 /** Paths address map fields; text indices are UTF-16 code units. */
 export type StructuredCommand =
+  | { type: 'moveBlock'; blockId: string; parentId: string; index: number }
   | { type: 'set'; path: string[]; value: EngineValue }
   | { type: 'delete'; path: string[] }
   | {
@@ -69,6 +70,9 @@ export interface WasmDocumentEngine {
   applyCommand(command: string): void;
   merge(checkpoint: Uint8Array): void;
   undo(): boolean;
+  redo(): boolean;
+  getCursor(pathJson: string, index: number): string;
+  resolveCursor(pathJson: string, cursor: string): number;
   generateSyncMessage(peerId: string): Uint8Array | undefined;
   receiveSyncMessage(peerId: string, message: Uint8Array): void;
   free(): void;

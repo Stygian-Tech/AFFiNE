@@ -2,7 +2,6 @@ import { BlockSuiteError, ErrorCode } from '@blocksuite/global/exceptions';
 import type { BaseTextAttributes } from '@blocksuite/store';
 import { html, render } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
-import * as Y from 'yjs';
 
 import type { VLine } from '../components/v-line.js';
 import type { InlineEditor } from '../inline-editor.js';
@@ -24,22 +23,12 @@ export class RenderService<TextAttributes extends BaseTextAttributes> {
     const lastEndRelativePosition = this.editor.lastEndRelativePosition;
     if (!lastStartRelativePosition || !lastEndRelativePosition) return;
 
-    const doc = this.editor.yText.doc;
-    if (!doc) {
-      console.error('doc is not found when syncing yText');
-      return;
-    }
-    const absoluteStart = Y.createAbsolutePositionFromRelativePosition(
-      lastStartRelativePosition,
-      doc
+    const startIndex = this.editor.textBackend.resolveAnchor(
+      lastStartRelativePosition
     );
-    const absoluteEnd = Y.createAbsolutePositionFromRelativePosition(
-      lastEndRelativePosition,
-      doc
+    const endIndex = this.editor.textBackend.resolveAnchor(
+      lastEndRelativePosition
     );
-
-    const startIndex = absoluteStart?.index;
-    const endIndex = absoluteEnd?.index;
     if (startIndex == null || endIndex == null) return;
 
     const newInlineRange: InlineRange = {
@@ -51,13 +40,10 @@ export class RenderService<TextAttributes extends BaseTextAttributes> {
     this.editor.setInlineRange(newInlineRange);
   };
 
-  private readonly _onYTextChange = (
-    _: Y.YTextEvent,
-    transaction: Y.Transaction
-  ) => {
+  private readonly _onYTextChange = (transaction: { local: boolean }) => {
     this.editor.slots.textChange.next();
 
-    const yText = this.editor.yText;
+    const yText = this.editor.textBackend;
 
     if (
       (this._carriageReturnValidationCounter++ & 0x3f) === 0 &&
@@ -78,12 +64,10 @@ export class RenderService<TextAttributes extends BaseTextAttributes> {
 
   mount = () => {
     const editor = this.editor;
-    const yText = editor.yText;
-
-    yText.observe(this._onYTextChange);
+    const unsubscribe = editor.textBackend.observe(this._onYTextChange);
     editor.disposables.add({
       dispose: () => {
-        yText.unobserve(this._onYTextChange);
+        unsubscribe();
         this._pendingRemoteInlineRangeSync = false;
       },
     });

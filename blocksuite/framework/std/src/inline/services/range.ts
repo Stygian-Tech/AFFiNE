@@ -1,6 +1,6 @@
 import type { BaseTextAttributes } from '@blocksuite/store';
+import type { RichTextAnchor } from '@blocksuite/store/engine';
 import { effect } from '@preact/signals-core';
-import * as Y from 'yjs';
 
 import type { VLine } from '../components/v-line.js';
 import type { InlineEditor } from '../inline-editor.js';
@@ -14,9 +14,9 @@ import {
 import { calculateTextLength, getTextNodesFromElement } from '../utils/text.js';
 
 export class RangeService<TextAttributes extends BaseTextAttributes> {
-  private _lastEndRelativePosition: Y.RelativePosition | null = null;
+  private _lastEndRelativePosition: RichTextAnchor | null = null;
 
-  private _lastStartRelativePosition: Y.RelativePosition | null = null;
+  private _lastStartRelativePosition: RichTextAnchor | null = null;
 
   focusEnd = (): void => {
     this.editor.setInlineRange({
@@ -225,7 +225,7 @@ export class RangeService<TextAttributes extends BaseTextAttributes> {
     return !(
       inlineRange &&
       (inlineRange.index < 0 ||
-        inlineRange.index + inlineRange.length > this.editor.yText.length)
+        inlineRange.index + inlineRange.length > this.editor.textBackend.length)
     );
   };
 
@@ -241,12 +241,12 @@ export class RangeService<TextAttributes extends BaseTextAttributes> {
         if (eq) return;
         lastInlineRange = newInlineRange;
 
-        const yText = editor.yText;
+        const yText = editor.textBackend;
         if (newInlineRange) {
-          this._lastStartRelativePosition =
-            Y.createRelativePositionFromTypeIndex(yText, newInlineRange.index);
-          this._lastEndRelativePosition = Y.createRelativePositionFromTypeIndex(
-            yText,
+          this._lastStartRelativePosition = yText.createAnchor(
+            newInlineRange.index
+          );
+          this._lastEndRelativePosition = yText.createAnchor(
             newInlineRange.index + newInlineRange.length
           );
         } else {
@@ -377,7 +377,7 @@ export class RangeService<TextAttributes extends BaseTextAttributes> {
    *    the second is `{index: 0, length: 6}`, the third is `{index: 0, length: 4}`
    */
   toInlineRange = (range: Range): InlineRange | null => {
-    const { rootElement, yText } = this.editor;
+    const { rootElement, textBackend: yText } = this.editor;
     if (!rootElement || !yText) return null;
     return domRangeToInlineRange(range, rootElement, yText);
   };

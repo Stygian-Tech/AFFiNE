@@ -130,10 +130,11 @@ export class InlineTextService<TextAttributes extends BaseTextAttributes> {
     });
   };
 
-  readonly transact = this.editor.transact;
+  readonly transact = (callback: () => void, withoutHistory = false) =>
+    this.editor.transact(callback, withoutHistory);
 
   get yText() {
-    return this.editor.yText;
+    return this.editor.textBackend;
   }
 
   constructor(readonly editor: InlineEditor<TextAttributes>) {}

@@ -13,14 +13,14 @@ test('real WASM fixture, native text marks, concurrent peer sync, selective undo
   await expect(
     page.getByText('BlockSuite editor gate: NOT PASSED.')
   ).toBeVisible();
+  await expect(page.getByTestId('text-A').locator('v-line')).toHaveCount(1);
   await expect(page.getByTestId('fixture-fidelity')).toHaveText(
     'Fixture fidelity: passed'
   );
   await page.getByRole('button', { name: 'Bold A', exact: true }).click();
-  await expect(page.getByTestId('text-A').locator('span').first()).toHaveCSS(
-    'font-weight',
-    '700'
-  );
+  await expect(
+    page.getByTestId('text-A').locator('[data-v-text]').first()
+  ).toHaveCSS('font-weight', '700');
   await page.getByRole('button', { name: 'Synchronize replicas' }).click();
   await page.getByRole('button', { name: 'Append A', exact: true }).click();
   await page.getByRole('button', { name: 'Append B', exact: true }).click();
@@ -44,6 +44,31 @@ test('real WASM fixture, native text marks, concurrent peer sync, selective undo
   await expect(page.locator('vite-error-overlay')).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath('desktop.png') });
   expect(errors).toEqual([]);
+});
+
+test('actual BlockSuite inline editor handles browser input backed by Automerge and peer updates', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const editor = page.getByRole('textbox', { name: 'BlockSuite text A' });
+  await expect(editor).toHaveAttribute('contenteditable', 'true');
+  await expect(editor.locator('v-line')).toHaveCount(1);
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+End');
+  await page.keyboard.type('!');
+  await expect(editor).toHaveText('Hello Atelier!');
+  await page.getByRole('button', { name: 'Synchronize replicas' }).click();
+  await expect(page.getByTestId('text-B')).toHaveText('Hello Atelier!');
+  await page.getByRole('button', { name: 'Undo A', exact: true }).click();
+  await expect(editor).toHaveText('Hello Atelier');
+  await page.getByRole('button', { name: 'Redo A', exact: true }).click();
+  await expect(editor).toHaveText('Hello Atelier!');
+  await page.getByRole('button', { name: 'Save checkpoint' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved locally');
+  await page.reload();
+  await page.getByRole('button', { name: 'Restore checkpoint' }).click();
+  await expect(page.getByTestId('text-A')).toHaveText('Hello Atelier!');
+  await expect(page.getByTestId('text-A').locator('v-line')).toHaveCount(1);
 });
 
 test('IndexedDB acknowledges save after commit and restores retained structured data after reload', async ({

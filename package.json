@@ -35,7 +35,7 @@
     "postinstall": "yarn affine init && yarn husky",
     "atelier:build:wasm": "bash scripts/atelier/build-wasm.sh",
     "atelier:gate": "yarn atelier:build:wasm && yarn workspace @affine/atelier-gate dev",
-    "atelier:test": "yarn atelier:build:wasm && cargo test --locked --manifest-path packages/common/atelier-document/Cargo.toml && yarn vitest run blocksuite/framework/store/src/__tests__/engine-snapshot.unit.spec.ts && yarn workspace @affine/atelier-gate test:wasm && yarn workspace @affine/atelier-gate test"
+    "atelier:test": "yarn atelier:build:wasm && cargo test --locked --manifest-path packages/common/atelier-document/Cargo.toml && yarn vitest run blocksuite/framework/store/src/__tests__/engine-snapshot.unit.spec.ts blocksuite/framework/std/src/__tests__/inline && yarn workspace @affine/atelier-gate test:wasm && yarn workspace @affine/atelier-gate test"
   },
   "lint-staged": {
     "*": "oxfmt --write --no-error-on-unmatched-pattern",

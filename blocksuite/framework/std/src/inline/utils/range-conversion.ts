@@ -1,5 +1,4 @@
 import { BlockSuiteError, ErrorCode } from '@blocksuite/global/exceptions';
-import type * as Y from 'yjs';
 
 import { VElement } from '../components/v-element.js';
 import type { InlineRange } from '../types.js';
@@ -13,7 +12,7 @@ import { calculateTextLength, getTextNodesFromElement } from './text.js';
 type InlineRangeRunnerContext = {
   rootElement: HTMLElement;
   range: Range;
-  yText: Y.Text;
+  yText: { readonly length: number };
   startNode: Node | null;
   startOffset: number;
   startText: Text;
@@ -137,7 +136,7 @@ const rangeHasNoAnchorAndFocusHandler: Handler = ({ yText }) => {
 const buildContext = (
   range: Range,
   rootElement: HTMLElement,
-  yText: Y.Text
+  yText: { readonly length: number }
 ): InlineRangeRunnerContext | null => {
   const { startContainer, startOffset, endContainer, endOffset } = range;
 
@@ -195,7 +194,7 @@ const buildContext = (
 export function domRangeToInlineRange(
   range: Range,
   rootElement: HTMLElement,
-  yText: Y.Text
+  yText: { readonly length: number }
 ): InlineRange | null {
   const context = buildContext(range, rootElement, yText);
 
