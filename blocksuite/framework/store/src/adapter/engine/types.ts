@@ -37,6 +37,14 @@ export type StructuredCommand =
   | { type: 'set'; path: string[]; value: EngineValue }
   | { type: 'delete'; path: string[] }
   | {
+      type: 'spliceList';
+      path: string[];
+      index: number;
+      delete: number;
+      values: EngineValue[];
+    }
+  | { type: 'batch'; commands: StructuredCommand[] }
+  | {
       type: 'spliceText';
       path: string[];
       index: number;
