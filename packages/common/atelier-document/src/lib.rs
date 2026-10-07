@@ -20,8 +20,18 @@ fn js(e: String) -> JsValue {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+  tag = "type",
+  rename_all = "camelCase",
+  rename_all_fields = "camelCase",
+  deny_unknown_fields
+)]
 pub enum Command {
+  MoveBlock {
+    block_id: String,
+    parent_id: String,
+    index: usize,
+  },
   Set {
     path: Vec<String>,
     value: Json,
@@ -220,7 +230,7 @@ impl DocumentEngine {
     })
   }
   pub fn snapshot_json(&self) -> Result<Json> {
-    read_object(&self.doc, &ROOT)
+    project_snapshot(read_object(&self.doc, &ROOT)?)
   }
   pub fn import(&mut self, snapshot: &Json) -> Result<()> {
     validate_snapshot(snapshot)?;
@@ -282,11 +292,19 @@ impl DocumentEngine {
     self.doc.get_cursor_position(&object, &cursor, None).map_err(err)
   }
   pub fn apply(&mut self, command: Command) -> Result<()> {
-    self.apply_inner(command, true)?;
+    self.apply_inner(command, true, false)?;
     self.future.clear();
     Ok(())
   }
-  fn apply_inner(&mut self, command: Command, validate_after: bool) -> Result<()> {
+  fn apply_inner(&mut self, command: Command, validate_after: bool, structural: bool) -> Result<()> {
+    if let Command::MoveBlock {
+      block_id,
+      parent_id,
+      index,
+    } = command
+    {
+      return self.move_block(block_id, parent_id, index, validate_after);
+    }
     if let Command::Batch { commands } = command {
       let mut engine = Self {
         doc: self.doc.clone(),
@@ -295,7 +313,7 @@ impl DocumentEngine {
         future: vec![],
       };
       for command in commands {
-        engine.apply_inner(command, false)?;
+        engine.apply_inner(command, false, structural)?;
       }
       if validate_after {
         validate(&engine.doc)?;
@@ -309,6 +327,9 @@ impl DocumentEngine {
     let undo = match command {
       Command::Set { path, value } => {
         writable_path(&path)?;
+        if !structural {
+          editable_path(&candidate, &path)?;
+        }
         let (parent, key) = parent_at(&candidate, &path)?;
         let previous = read_property(&candidate, &parent, path_prop(&candidate, &parent, &key)?)?.zip(
           candidate
@@ -338,6 +359,9 @@ impl DocumentEngine {
       }
       Command::Delete { path } => {
         writable_path(&path)?;
+        if !structural {
+          editable_path(&candidate, &path)?;
+        }
         let (parent, key) = parent_at(&candidate, &path)?;
         let prop = path_prop(&candidate, &parent, &key)?;
         let previous = read_property(&candidate, &parent, prop.clone())?
@@ -364,6 +388,9 @@ impl DocumentEngine {
         values,
       } => {
         writable_path(&path)?;
+        if !structural {
+          editable_path(&candidate, &path)?;
+        }
         let object = object_at(&candidate, &path)?;
         if candidate.object_type(&object).map_err(err)? != ObjType::List {
           return Err("splice target is not a list".into());
@@ -397,7 +424,7 @@ impl DocumentEngine {
           anchor,
         })
       }
-      Command::Batch { .. } => unreachable!(),
+      Command::Batch { .. } | Command::MoveBlock { .. } => unreachable!(),
       Command::SpliceText {
         path,
         index,
@@ -405,6 +432,9 @@ impl DocumentEngine {
         text,
       } => {
         writable_path(&path)?;
+        if !structural {
+          editable_path(&candidate, &path)?;
+        }
         let object = text_at(&candidate, &path)?;
         if candidate.object_type(&object).map_err(err)? != ObjType::Text {
           return Err("splice target is not rich text".into());
@@ -477,6 +507,9 @@ impl DocumentEngine {
         value,
       } => {
         writable_path(&path)?;
+        if !structural {
+          editable_path(&candidate, &path)?;
+        }
         let object = text_at(&candidate, &path)?;
         if candidate.object_type(&object).map_err(err)? != ObjType::Text {
           return Err("mark target is not rich text".into());
@@ -518,6 +551,88 @@ impl DocumentEngine {
       self.history.push(undo);
     }
     Ok(())
+  }
+  fn move_block(&mut self, block_id: String, parent_id: String, index: usize, validate_after: bool) -> Result<()> {
+    let snapshot = self.snapshot_json()?;
+    let blocks = snapshot["blocks"].as_object().ok_or("blocks must be a map")?;
+    let root = snapshot["rootId"].as_str().ok_or("move requires a root")?;
+    if block_id == root || !blocks.contains_key(&block_id) || !blocks.contains_key(&parent_id) {
+      return Err("move requires an existing nonroot block and existing parent".into());
+    }
+    let mut ancestor = parent_id.as_str();
+    loop {
+      if ancestor == block_id {
+        return Err("local move would create a cycle".into());
+      }
+      let Some(parent) = blocks[ancestor]["parentId"].as_str() else {
+        break;
+      };
+      ancestor = parent;
+    }
+    let siblings: Vec<_> = blocks[&parent_id]["children"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .filter_map(Json::as_str)
+      .filter(|id| *id != block_id)
+      .collect();
+    if index > siblings.len() {
+      return Err("move index outside destination children".into());
+    }
+    let next = siblings.get(index).copied();
+    let mut commands = vec![];
+    // Remove all visible hints for this block, including stale entries from prior
+    // concurrent moves. The authoritative parent register changes independently.
+    for id in blocks.keys() {
+      let path = vec!["blocks".into(), id.clone(), "children".into()];
+      let object = object_at(&self.doc, &path)?;
+      for i in (0..self.doc.length(&object)).rev() {
+        if read_property(&self.doc, &object, i.into())? == Some(json!(block_id)) {
+          commands.push(Command::SpliceList {
+            path: path.clone(),
+            index: i,
+            delete: 1,
+            values: vec![],
+          });
+        }
+      }
+    }
+    commands.push(Command::Set {
+      path: vec!["blocks".into(), block_id.clone(), "parentId".into()],
+      value: json!(parent_id),
+    });
+    let raw_children = &read_object(&self.doc, &ROOT)?["blocks"][&parent_id]["children"];
+    let mut remaining: Vec<Json> = raw_children
+      .as_array()
+      .ok_or("children must be a list")?
+      .iter()
+      .filter(|value| value.as_str() != Some(&block_id))
+      .cloned()
+      .collect();
+    let missing: Vec<Json> = siblings
+      .iter()
+      .filter(|sibling| !remaining.iter().any(|value| value.as_str() == Some(**sibling)))
+      .map(|sibling| json!(sibling))
+      .collect();
+    if !missing.is_empty() {
+      commands.push(Command::SpliceList {
+        path: vec!["blocks".into(), parent_id.clone(), "children".into()],
+        index: remaining.len(),
+        delete: 0,
+        values: missing.clone(),
+      });
+      remaining.extend(missing);
+    }
+    let raw_index = next
+      .and_then(|next| remaining.iter().position(|value| value.as_str() == Some(next)))
+      .unwrap_or(remaining.len());
+    commands.push(Command::SpliceList {
+      path: vec!["blocks".into(), parent_id, "children".into()],
+      index: raw_index,
+      delete: 0,
+      values: vec![json!(block_id)],
+    });
+    self.apply_inner(Command::Batch { commands }, validate_after, true)
   }
   pub fn undo_local(&mut self) -> Result<bool> {
     self.travel_history(false)
@@ -1086,6 +1201,26 @@ fn writable_path(path: &[String]) -> Result<()> {
     _ => Err("commands may only edit blocks, metadata, or rootId".into()),
   }
 }
+fn editable_path(doc: &AutoCommit, path: &[String]) -> Result<()> {
+  if path.first().map(String::as_str) == Some("blocks") {
+    if path.len() >= 3 && matches!(path[2].as_str(), "parentId" | "children") {
+      return Err("tree edits require moveBlock".into());
+    }
+    if path.len() == 2 {
+      let blocks = object_at(doc, &["blocks".into()])?;
+      if doc.get(&blocks, path[1].as_str()).map_err(err)?.is_some() {
+        return Err("existing block replacement/deletion is unsupported; edit properties or use moveBlock".into());
+      }
+    }
+  }
+  if path.first().map(String::as_str) == Some("rootId")
+    && !read_property(doc, &ROOT, "rootId".into())?.is_some_and(|v| v.is_null())
+  {
+    return Err("rootId is immutable after initialization".into());
+  }
+  Ok(())
+}
+
 fn parent_at(doc: &AutoCommit, path: &[String]) -> Result<(ObjId, String)> {
   let (key, parent) = path.split_last().ok_or("empty path")?;
   Ok((object_at(doc, parent)?, key.clone()))
@@ -1322,13 +1457,20 @@ fn validate(doc: &AutoCommit) -> Result<()> {
   if schemas.len() != 1 {
     return Err("checkpoint has missing or conflicting schema version".into());
   }
+  if doc.get_all(&ROOT, "rootId").map_err(err)?.len() != 1 {
+    return Err("checkpoint has missing or conflicting root identity".into());
+  }
   let identities = doc.get_all(&ROOT, "documentId").map_err(err)?;
   if identities.len() != 1 || !matches!(identities[0].0.to_scalar(), Some(ScalarValue::Str(_))) {
     return Err("checkpoint has missing or conflicting document identity".into());
   }
-  validate_snapshot(&read_object(doc, &ROOT)?)
+  validate_snapshot(&project_snapshot(read_object(doc, &ROOT)?)?)
 }
 fn validate_snapshot(snapshot: &Json) -> Result<()> {
+  validate_shape(snapshot)?;
+  validate_tree(snapshot)
+}
+fn validate_shape(snapshot: &Json) -> Result<()> {
   let map = snapshot.as_object().ok_or("checkpoint root must be a map")?;
   if map
     .keys()
@@ -1376,8 +1518,85 @@ fn validate_snapshot(snapshot: &Json) -> Result<()> {
       return Err(format!("invalid children in block {id}"));
     }
   }
-  validate_tree(snapshot)
+  Ok(())
 }
+// Raw placement is a convergent Automerge parent register. Lists retain ordering
+// hints, not independent ownership. Projection repairs graph conflicts without
+// rewriting CRDT history, and never accepts an unsupported schema or block shape.
+fn project_snapshot(mut snapshot: Json) -> Result<Json> {
+  validate_shape(&snapshot)?;
+  let blocks = snapshot["blocks"].as_object().unwrap();
+  let Some(root) = snapshot["rootId"].as_str().map(String::from) else {
+    if blocks.is_empty() {
+      return Ok(snapshot);
+    }
+    return Err("nonempty document requires rootId".into());
+  };
+  let root_block = blocks.get(&root).ok_or("rootId references a missing block")?;
+  if !root_block["parentId"].is_null() {
+    return Err("root block must have null parentId".into());
+  }
+  let mut ids: Vec<_> = blocks.keys().cloned().collect();
+  ids.sort();
+  let mut parents: HashMap<String, String> = ids
+    .iter()
+    .filter(|id| **id != root)
+    .map(|id| {
+      let parent = blocks[id]["parentId"]
+        .as_str()
+        .filter(|parent| blocks.contains_key(*parent))
+        .unwrap_or(&root);
+      (id.clone(), parent.to_string())
+    })
+    .collect();
+  // Sorted traversal and smallest-ID cycle victim give every replica the same
+  // root fallback for a two-way or longer concurrent cycle.
+  for id in &ids {
+    if *id == root {
+      continue;
+    }
+    let mut chain: Vec<String> = vec![];
+    let mut current = id.clone();
+    while current != root {
+      if let Some(start) = chain.iter().position(|item| item == &current) {
+        let victim = chain[start..].iter().min().unwrap().clone();
+        parents.insert(victim, root.clone());
+        break;
+      }
+      chain.push(current.clone());
+      current = parents[&current].clone();
+    }
+  }
+  let mut children = HashMap::new();
+  for id in &ids {
+    let mut ordered = vec![];
+    let mut seen = HashSet::new();
+    for child in blocks[id]["children"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .filter_map(Json::as_str)
+    {
+      if parents.get(child) == Some(id) && seen.insert(child.to_string()) {
+        ordered.push(child.to_string());
+      }
+    }
+    for child in &ids {
+      if parents.get(child) == Some(id) && seen.insert(child.clone()) {
+        ordered.push(child.clone());
+      }
+    }
+    children.insert(id.clone(), ordered);
+  }
+  let blocks = snapshot["blocks"].as_object_mut().unwrap();
+  for id in ids {
+    blocks[&id]["parentId"] = if id == root { Json::Null } else { json!(parents[&id]) };
+    blocks[&id]["children"] = json!(children[&id]);
+  }
+  validate_tree(&snapshot)?;
+  Ok(snapshot)
+}
+
 fn validate_identity(id: &str, actor: Option<&str>) -> Result<()> {
   if id.is_empty() {
     return Err("documentId must not be empty".into());
@@ -1837,32 +2056,26 @@ mod tests {
   #[test]
   fn batch_can_create_and_reparent_block_without_invalid_intermediate_tree() {
     let mut d = seeded();
-    d.apply(Command::Batch { commands:vec![
-      Command::Set { path:path(&["blocks","new"]),value:json!({"id":"new","flavour":"affine:paragraph","parentId":"root","children":[],"props":{"text":{"$blocksuite:internal:text$":true,"delta":[]}}}) },
-      Command::SpliceList { path:path(&["blocks","root","children"]),index:2,delete:0,values:vec![json!("new")] },
-    ] }).unwrap();
     d.apply(Command::Batch {
       commands: vec![
-        Command::SpliceList {
-          path: path(&["blocks", "root", "children"]),
-          index: 2,
-          delete: 1,
-          values: vec![],
-        },
         Command::Set {
-          path: path(&["blocks", "new", "parentId"]),
-          value: json!("text"),
+          path: path(&["blocks", "new"]),
+          value: json!({"id":"new","flavour":"affine:paragraph","parentId":"root","children":[],"props":{}}),
         },
-        Command::SpliceList {
-          path: path(&["blocks", "text", "children"]),
-          index: 0,
-          delete: 0,
-          values: vec![json!("new")],
+        Command::MoveBlock {
+          block_id: "new".into(),
+          parent_id: "root".into(),
+          index: 2,
         },
       ],
     })
     .unwrap();
-    assert_eq!(d.snapshot_json().unwrap()["blocks"]["new"]["parentId"], json!("text"));
+    d.apply(Command::MoveBlock {
+      block_id: "new".into(),
+      parent_id: "text".into(),
+      index: 0,
+    })
+    .unwrap();
     let moved = d.snapshot_json().unwrap();
     assert!(d.undo_local().unwrap());
     assert_eq!(d.snapshot_json().unwrap()["blocks"]["new"]["parentId"], json!("root"));
@@ -1873,53 +2086,27 @@ mod tests {
     assert_eq!(d.snapshot_json().unwrap(), moved);
   }
   #[test]
-  fn divergent_tree_merge_rejection_preserves_active_checkpoint() {
+  fn opposing_concurrent_moves_project_same_cycle_break() {
     let (mut a, mut b) = replicas();
-    a.apply(Command::Batch {
-      commands: vec![
-        Command::SpliceList {
-          path: path(&["blocks", "root", "children"]),
-          index: 0,
-          delete: 1,
-          values: vec![],
-        },
-        Command::Set {
-          path: path(&["blocks", "text", "parentId"]),
-          value: json!("surface"),
-        },
-        Command::SpliceList {
-          path: path(&["blocks", "surface", "children"]),
-          index: 0,
-          delete: 0,
-          values: vec![json!("text")],
-        },
-      ],
+    a.apply(Command::MoveBlock {
+      block_id: "text".into(),
+      parent_id: "surface".into(),
+      index: 0,
     })
     .unwrap();
-    b.apply(Command::Batch {
-      commands: vec![
-        Command::SpliceList {
-          path: path(&["blocks", "root", "children"]),
-          index: 1,
-          delete: 1,
-          values: vec![],
-        },
-        Command::Set {
-          path: path(&["blocks", "surface", "parentId"]),
-          value: json!("text"),
-        },
-        Command::SpliceList {
-          path: path(&["blocks", "text", "children"]),
-          index: 0,
-          delete: 0,
-          values: vec![json!("surface")],
-        },
-      ],
+    b.apply(Command::MoveBlock {
+      block_id: "surface".into(),
+      parent_id: "text".into(),
+      index: 0,
     })
     .unwrap();
-    let checkpoint = a.save();
-    assert!(a.merge_bytes(&b.save()).is_err());
-    assert_eq!(a.save(), checkpoint);
+    converge(&mut a, &mut b);
+    let snapshot = a.snapshot_json().unwrap();
+    assert_eq!(snapshot["blocks"]["surface"]["parentId"], json!("root"));
+    assert_eq!(snapshot["blocks"]["text"]["parentId"], json!("surface"));
+    validate_tree(&snapshot).unwrap();
+    let restored = DocumentEngine::from_bytes(&a.save(), Some("restored")).unwrap();
+    assert_eq!(restored.snapshot_json().unwrap(), snapshot);
   }
   #[test]
   fn formatting_undo_keeps_peer_insert_and_redo_converges() {
@@ -2305,5 +2492,202 @@ mod tests {
     })
     .unwrap();
     assert_eq!(d.cursor_position(&p, &cursor).unwrap(), 4);
+  }
+  fn tree_seed() -> DocumentEngine {
+    let mut snapshot = fixture();
+    for id in ["a", "b", "c"] {
+      snapshot["blocks"][id] = json!({"id":id,"flavour":"affine:note","parentId":"root","children":[],"props":{}});
+    }
+    snapshot["blocks"]["root"]["children"] = json!(["text", "surface", "a", "b", "c"]);
+    let mut seed = DocumentEngine::create("doc", Some("tree-seed")).unwrap();
+    seed.import(&snapshot).unwrap();
+    seed
+  }
+  fn move_to(engine: &mut DocumentEngine, block: &str, parent: &str, index: usize) {
+    engine
+      .apply(Command::MoveBlock {
+        block_id: block.into(),
+        parent_id: parent.into(),
+        index,
+      })
+      .unwrap();
+  }
+  #[test]
+  fn same_block_concurrent_different_parents_has_one_projected_owner() {
+    let bytes = tree_seed().save();
+    let mut a = DocumentEngine::from_bytes(&bytes, Some("alice")).unwrap();
+    let mut b = DocumentEngine::from_bytes(&bytes, Some("bob")).unwrap();
+    move_to(&mut a, "c", "a", 0);
+    move_to(&mut b, "c", "b", 0);
+    converge(&mut a, &mut b);
+    let snapshot = a.snapshot_json().unwrap();
+    let parent = snapshot["blocks"]["c"]["parentId"].as_str().unwrap();
+    assert!(["a", "b"].contains(&parent));
+    let owner_count = snapshot["blocks"]
+      .as_object()
+      .unwrap()
+      .values()
+      .filter(|block| block["children"].as_array().unwrap().contains(&json!("c")))
+      .count();
+    assert_eq!(owner_count, 1);
+    let restored = DocumentEngine::from_bytes(&b.save(), Some("restored")).unwrap();
+    assert_eq!(restored.snapshot_json().unwrap(), snapshot);
+    // Conflicting parent writes form an undo barrier, without removing either
+    // peer's ordering hints or rewriting the selected parent register winner.
+    let before = a.save();
+    assert!(!a.undo_local().unwrap());
+    assert_eq!(a.save(), before);
+  }
+  #[test]
+  fn reorder_moves_roundtrip_and_concurrent_reorders_converge_without_duplicates() {
+    let bytes = tree_seed().save();
+    let mut a = DocumentEngine::from_bytes(&bytes, Some("alice")).unwrap();
+    let original = a.snapshot_json().unwrap();
+    move_to(&mut a, "c", "root", 0);
+    assert_eq!(
+      a.snapshot_json().unwrap()["blocks"]["root"]["children"],
+      json!(["c", "text", "surface", "a", "b"])
+    );
+    assert!(a.undo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap(), original);
+    assert!(a.redo_local().unwrap());
+    let mut b = DocumentEngine::from_bytes(&bytes, Some("bob")).unwrap();
+    move_to(&mut b, "c", "root", 2);
+    converge(&mut a, &mut b);
+    validate_tree(&a.snapshot_json().unwrap()).unwrap();
+    assert_eq!(
+      a.snapshot_json().unwrap()["blocks"]["root"]["children"]
+        .as_array()
+        .unwrap()
+        .len(),
+      5
+    );
+  }
+  #[test]
+  fn three_way_cycle_converges_in_all_merge_orders_and_native_sync() {
+    let bytes = tree_seed().save();
+    let mut a = DocumentEngine::from_bytes(&bytes, Some("alice")).unwrap();
+    let mut b = DocumentEngine::from_bytes(&bytes, Some("bob")).unwrap();
+    let mut c = DocumentEngine::from_bytes(&bytes, Some("carol")).unwrap();
+    move_to(&mut a, "a", "b", 0);
+    move_to(&mut b, "b", "c", 0);
+    move_to(&mut c, "c", "a", 0);
+    let checkpoints = [a.save(), b.save(), c.save()];
+    let mut expected = None;
+    for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+      let mut replica = DocumentEngine::from_bytes(&bytes, Some("observer")).unwrap();
+      for index in order {
+        replica.merge_bytes(&checkpoints[index]).unwrap();
+      }
+      let snapshot = replica.snapshot_json().unwrap();
+      assert_eq!(snapshot["blocks"]["a"]["parentId"], json!("root"));
+      assert_eq!(snapshot["blocks"]["b"]["parentId"], json!("c"));
+      assert_eq!(snapshot["blocks"]["c"]["parentId"], json!("a"));
+      validate_tree(&snapshot).unwrap();
+      if let Some(expected) = &expected {
+        assert_eq!(&snapshot, expected);
+      } else {
+        expected = Some(snapshot);
+      }
+      let restored = DocumentEngine::from_bytes(&replica.save(), Some("loaded")).unwrap();
+      assert_eq!(restored.snapshot_json().unwrap(), *expected.as_ref().unwrap());
+    }
+    for _ in 0..20 {
+      let mut sent = false;
+      if let Some(message) = a.generate_sync_message("bob") {
+        b.receive_sync_message("alice", &message).unwrap();
+        sent = true;
+      }
+      if let Some(message) = b.generate_sync_message("alice") {
+        a.receive_sync_message("bob", &message).unwrap();
+        sent = true;
+      }
+      if let Some(message) = b.generate_sync_message("carol") {
+        c.receive_sync_message("bob", &message).unwrap();
+        sent = true;
+      }
+      if let Some(message) = c.generate_sync_message("bob") {
+        b.receive_sync_message("carol", &message).unwrap();
+        sent = true;
+      }
+      if !sent {
+        break;
+      }
+    }
+    assert_eq!(a.snapshot_json().unwrap(), *expected.as_ref().unwrap());
+    assert_eq!(b.snapshot_json().unwrap(), a.snapshot_json().unwrap());
+    assert_eq!(c.snapshot_json().unwrap(), a.snapshot_json().unwrap());
+  }
+  #[test]
+  fn local_cycles_and_generic_tree_writes_reject_atomically() {
+    let mut d = tree_seed();
+    move_to(&mut d, "b", "a", 0);
+    let before = d.save();
+    for command in [
+      Command::MoveBlock {
+        block_id: "a".into(),
+        parent_id: "b".into(),
+        index: 0,
+      },
+      Command::MoveBlock {
+        block_id: "a".into(),
+        parent_id: "a".into(),
+        index: 0,
+      },
+      Command::MoveBlock {
+        block_id: "root".into(),
+        parent_id: "a".into(),
+        index: 0,
+      },
+      Command::MoveBlock {
+        block_id: "a".into(),
+        parent_id: "missing".into(),
+        index: 0,
+      },
+      Command::MoveBlock {
+        block_id: "a".into(),
+        parent_id: "root".into(),
+        index: 99,
+      },
+      Command::Set {
+        path: path(&["blocks", "a", "parentId"]),
+        value: json!("c"),
+      },
+      Command::SpliceList {
+        path: path(&["blocks", "root", "children"]),
+        index: 0,
+        delete: 1,
+        values: vec![],
+      },
+      Command::Delete {
+        path: path(&["blocks", "a"]),
+      },
+      Command::Set {
+        path: path(&["blocks", "a"]),
+        value: json!({}),
+      },
+      Command::Set {
+        path: path(&["rootId"]),
+        value: json!("a"),
+      },
+    ] {
+      assert!(d.apply(command).is_err());
+      assert_eq!(d.save(), before);
+    }
+    let parsed: Command =
+      serde_json::from_value(json!({"type":"moveBlock","blockId":"c","parentId":"a","index":1})).unwrap();
+    d.apply(parsed).unwrap();
+  }
+  #[test]
+  fn graph_projection_does_not_accept_incompatible_schema_or_malformed_blocks() {
+    let mut snapshot = fixture();
+    snapshot["blocks"]["text"]["parentId"] = json!("surface");
+    snapshot["blocks"]["surface"]["parentId"] = json!("text");
+    assert!(project_snapshot(snapshot.clone()).is_ok());
+    snapshot["schemaVersion"] = json!(3);
+    assert!(project_snapshot(snapshot.clone()).is_err());
+    snapshot["schemaVersion"] = json!(2);
+    snapshot["blocks"]["text"]["props"] = json!(null);
+    assert!(project_snapshot(snapshot).is_err());
   }
 }

@@ -7,6 +7,7 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 export type AtelierDocumentCommand =
+  | { type: 'moveBlock'; blockId: string; parentId: string; index: number }
   | { type: 'set'; path: string[]; value: JsonValue }
   | { type: 'delete'; path: string[] }
   | {
