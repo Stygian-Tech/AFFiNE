@@ -57,6 +57,9 @@ export interface AtelierDocumentEngine {
   merge(bytes: Uint8Array): void;
   /** Unsupported inverses throw; concurrent field changes return false without overwriting them. */
   undo(): boolean;
+  redo(): boolean;
+  getCursor(pathJson: string, index: number): string;
+  resolveCursor(pathJson: string, cursor: string): number;
   generateSyncMessage(peerId: string): Uint8Array | undefined;
   receiveSyncMessage(peerId: string, bytes: Uint8Array): void;
   free(): void;

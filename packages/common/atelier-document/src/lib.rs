@@ -1,7 +1,7 @@
 //! Structured Automerge checkpoints for the Atelier BlockSuite compatibility gate.
 //! All editor positions use UTF-16 code units, matching browser text APIs.
 use automerge::{
-  ActorId, AutoCommit, Cursor, ObjId, ObjType, Prop, ROOT, ReadDoc, ScalarValue, TextEncoding, Value,
+  ActorId, AutoCommit, ChangeHash, Cursor, ObjId, ObjType, Prop, ROOT, ReadDoc, ScalarValue, TextEncoding, Value,
   marks::{ExpandMark, Mark},
   sync::{Message, State, SyncDoc},
   transaction::Transactable,
@@ -56,6 +56,20 @@ pub enum Command {
 #[derive(Clone)]
 enum Undo {
   Unsupported(&'static str),
+  Batch(Vec<Undo>),
+  Deleted {
+    parent: ObjId,
+    key: String,
+    previous: Json,
+    previous_id: ObjId,
+    heads: Vec<ChangeHash>,
+  },
+  Marks {
+    object: ObjId,
+    name: String,
+    previous: Vec<(ObjId, ScalarValue)>,
+    heads: Vec<ChangeHash>,
+  },
   Set {
     parent: ObjId,
     key: String,
@@ -63,10 +77,17 @@ enum Undo {
     applied: Json,
     previous: Option<(Json, ObjId)>,
   },
+  List {
+    object: ObjId,
+    inserted: HashMap<ObjId, Json>,
+    removed: Vec<(Json, ObjId)>,
+    anchor: Cursor,
+  },
   Text {
     object: ObjId,
     inserted: HashSet<ObjId>,
     removed: String,
+    removed_ids: Vec<ObjId>,
     marks: Vec<Mark>,
     anchor: Cursor,
   },
@@ -77,6 +98,7 @@ pub struct DocumentEngine {
   doc: AutoCommit,
   peers: HashMap<String, State>,
   history: Vec<Undo>,
+  future: Vec<Undo>,
 }
 
 #[wasm_bindgen]
@@ -115,6 +137,19 @@ impl DocumentEngine {
   }
   pub fn undo(&mut self) -> std::result::Result<bool, JsValue> {
     self.undo_local().map_err(js)
+  }
+  pub fn redo(&mut self) -> std::result::Result<bool, JsValue> {
+    self.redo_local().map_err(js)
+  }
+  #[wasm_bindgen(js_name = getCursor)]
+  pub fn get_cursor(&self, path_json: &str, index: usize) -> std::result::Result<String, JsValue> {
+    let path: Vec<String> = serde_json::from_str(path_json).map_err(|e| js(err(e)))?;
+    self.cursor_at(&path, index).map_err(js)
+  }
+  #[wasm_bindgen(js_name = resolveCursor)]
+  pub fn resolve_cursor(&self, path_json: &str, cursor: &str) -> std::result::Result<usize, JsValue> {
+    let path: Vec<String> = serde_json::from_str(path_json).map_err(|e| js(err(e)))?;
+    self.cursor_position(&path, cursor).map_err(js)
   }
   #[wasm_bindgen(js_name = generateSyncMessage)]
   pub fn generate_sync_message(&mut self, peer: &str) -> Option<Vec<u8>> {
@@ -159,6 +194,7 @@ impl DocumentEngine {
       doc,
       peers: HashMap::new(),
       history: vec![],
+      future: vec![],
     })
   }
   pub fn from_bytes(bytes: &[u8], actor: Option<&str>) -> Result<Self> {
@@ -180,6 +216,7 @@ impl DocumentEngine {
       doc,
       peers: HashMap::new(),
       history: vec![],
+      future: vec![],
     })
   }
   pub fn snapshot_json(&self) -> Result<Json> {
@@ -204,6 +241,7 @@ impl DocumentEngine {
     validate(&candidate)?;
     self.doc = candidate;
     self.history.clear();
+    self.future.clear();
     self.peers.clear();
     Ok(())
   }
@@ -220,8 +258,33 @@ impl DocumentEngine {
     self.doc = candidate;
     Ok(())
   }
+  pub fn cursor_at(&self, path: &[String], index: usize) -> Result<String> {
+    let object = text_at(&self.doc, path)?;
+    let units: Vec<_> = self.doc.text(&object).map_err(err)?.encode_utf16().collect();
+    if index > units.len() {
+      return Err("cursor outside text".into());
+    }
+    utf16_boundary(&units, index)?;
+    let position = if index == units.len() {
+      automerge::CursorPosition::End
+    } else {
+      index.into()
+    };
+    self
+      .doc
+      .get_cursor(&object, position, None)
+      .map(|c| c.to_string())
+      .map_err(err)
+  }
+  pub fn cursor_position(&self, path: &[String], cursor: &str) -> Result<usize> {
+    let object = text_at(&self.doc, path)?;
+    let cursor = Cursor::try_from(cursor).map_err(err)?;
+    self.doc.get_cursor_position(&object, &cursor, None).map_err(err)
+  }
   pub fn apply(&mut self, command: Command) -> Result<()> {
-    self.apply_inner(command, true)
+    self.apply_inner(command, true)?;
+    self.future.clear();
+    Ok(())
   }
   fn apply_inner(&mut self, command: Command, validate_after: bool) -> Result<()> {
     if let Command::Batch { commands } = command {
@@ -229,6 +292,7 @@ impl DocumentEngine {
         doc: self.doc.clone(),
         peers: HashMap::new(),
         history: vec![],
+        future: vec![],
       };
       for command in commands {
         engine.apply_inner(command, false)?;
@@ -237,7 +301,7 @@ impl DocumentEngine {
         validate(&engine.doc)?;
       }
       self.doc = engine.doc;
-      self.history.push(Undo::Unsupported("batch undo is not implemented"));
+      self.history.push(Undo::Batch(engine.history));
       return Ok(());
     }
     // Invalid commands must not leave partially applied operations behind.
@@ -275,11 +339,23 @@ impl DocumentEngine {
       Command::Delete { path } => {
         writable_path(&path)?;
         let (parent, key) = parent_at(&candidate, &path)?;
-        candidate
-          .delete(&parent, path_prop(&candidate, &parent, &key)?)
-          .map_err(err)?;
-        // Deletion undo needs an operation-aware resurrection policy; fail rather than overwrite remote edits.
-        Some(Undo::Unsupported("deletion undo requires operation-aware resurrection"))
+        let prop = path_prop(&candidate, &parent, &key)?;
+        let previous = read_property(&candidate, &parent, prop.clone())?
+          .zip(candidate.get(&parent, prop.clone()).map_err(err)?.map(|v| v.1));
+        candidate.delete(&parent, prop).map_err(err)?;
+        if candidate.object_type(&parent).map_err(err)? != ObjType::Map {
+          Some(Undo::Unsupported("list deletion undo is not implemented"))
+        } else if let Some((previous, previous_id)) = previous {
+          Some(Undo::Deleted {
+            parent,
+            key,
+            previous,
+            previous_id,
+            heads: candidate.get_heads(),
+          })
+        } else {
+          Some(Undo::Batch(vec![]))
+        }
       }
       Command::SpliceList {
         path,
@@ -296,6 +372,10 @@ impl DocumentEngine {
         if index > len || delete > len - index {
           return Err("list range outside document".into());
         }
+        let anchor = sequence_cursor(&candidate, &object, index + delete)?;
+        let removed = (index..index + delete)
+          .map(|i| list_value(&candidate, &object, i))
+          .collect::<Result<Vec<_>>>()?;
         candidate
           .splice(
             &object,
@@ -307,7 +387,15 @@ impl DocumentEngine {
         for (offset, value) in values.iter().enumerate() {
           write_json(&mut candidate, &object, (index + offset).into(), value, true)?;
         }
-        Some(Undo::Unsupported("list undo is not implemented"))
+        let inserted = (index..index + values.len())
+          .map(|i| list_value(&candidate, &object, i).map(|(value, id)| (id, value)))
+          .collect::<Result<HashMap<_, _>>>()?;
+        Some(Undo::List {
+          object,
+          inserted,
+          removed,
+          anchor,
+        })
       }
       Command::Batch { .. } => unreachable!(),
       Command::SpliceText {
@@ -330,12 +418,21 @@ impl DocumentEngine {
         utf16_boundary(&units, index)?;
         utf16_boundary(&units, index + delete)?;
         let removed = String::from_utf16(&units[index..index + delete]).map_err(err)?;
-        let anchor = if index == units.len() {
+        let removed_ids = (index..index + delete)
+          .map(|i| {
+            candidate
+              .get(&object, i)
+              .map_err(err)?
+              .map(|v| v.1)
+              .ok_or("missing removed character".into())
+          })
+          .collect::<Result<Vec<_>>>()?;
+        let anchor = if index + delete == units.len() {
           candidate
             .get_cursor(&object, automerge::CursorPosition::End, None)
             .map_err(err)?
         } else {
-          candidate.get_cursor(&object, index, None).map_err(err)?
+          candidate.get_cursor(&object, index + delete, None).map_err(err)?
         };
         let before: HashSet<_> = (0..candidate.length(&object))
           .filter_map(|i| candidate.get(&object, i).ok().flatten().map(|v| v.1))
@@ -367,6 +464,7 @@ impl DocumentEngine {
           object,
           inserted,
           removed,
+          removed_ids,
           marks,
           anchor,
         })
@@ -389,6 +487,7 @@ impl DocumentEngine {
         }
         utf16_boundary(&units, start)?;
         utf16_boundary(&units, end)?;
+        let previous = capture_marks(&candidate, &object, &name, start, end)?;
         if value.is_null() {
           candidate
             .unmark(&object, &name, start, end, ExpandMark::Both)
@@ -397,12 +496,17 @@ impl DocumentEngine {
           candidate
             .mark(
               &object,
-              Mark::new(name, value.to_string(), start, end),
+              Mark::new(name.clone(), value.to_string(), start, end),
               ExpandMark::Both,
             )
             .map_err(err)?;
         }
-        Some(Undo::Unsupported("formatting undo is not implemented"))
+        Some(Undo::Marks {
+          object,
+          name,
+          previous,
+          heads: candidate.get_heads(),
+        })
       }
     };
     candidate.commit();
@@ -416,97 +520,556 @@ impl DocumentEngine {
     Ok(())
   }
   pub fn undo_local(&mut self) -> Result<bool> {
-    let Some(undo) = self.history.last().cloned() else {
+    self.travel_history(false)
+  }
+  pub fn redo_local(&mut self) -> Result<bool> {
+    self.travel_history(true)
+  }
+  fn travel_history(&mut self, redo: bool) -> Result<bool> {
+    let stack = if redo { &self.future } else { &self.history };
+    let Some(undo) = stack.last().cloned() else {
       return Ok(false);
     };
     let mut candidate = self.doc.clone();
-    match undo {
-      Undo::Unsupported(reason) => return Err(reason.into()),
-      Undo::Set {
+    let mut aliases = HashMap::new();
+    let Some(mut inverse) = invert(&mut candidate, undo, &mut aliases)? else {
+      return Ok(false);
+    };
+    candidate.commit();
+    validate(&candidate)?;
+    let mut history = self.history.clone();
+    let mut future = self.future.clone();
+    for undo in history.iter_mut().chain(future.iter_mut()) {
+      rebase_undo(undo, &aliases)?;
+    }
+    rebase_undo(&mut inverse, &aliases)?;
+    self.doc = candidate;
+    self.history = history;
+    self.future = future;
+    if redo {
+      self.future.pop();
+      self.history.push(inverse);
+    } else {
+      self.history.pop();
+      self.future.push(inverse);
+    }
+    Ok(true)
+  }
+}
+
+// History writes new CRDT operations. Inverses target original operation identities;
+// they never restore a whole checkpoint or delete interleaved peer characters.
+fn invert(candidate: &mut AutoCommit, undo: Undo, aliases: &mut HashMap<ObjId, ObjId>) -> Result<Option<Undo>> {
+  match undo {
+    Undo::Unsupported(reason) => Err(reason.into()),
+    Undo::Batch(commands) => {
+      let mut inverse = vec![];
+      for mut command in commands.into_iter().rev() {
+        rebase_undo(&mut command, aliases)?;
+        let Some(command) = invert(candidate, command, aliases)? else {
+          return Ok(None);
+        };
+        inverse.push(command);
+      }
+      Ok(Some(Undo::Batch(inverse)))
+    }
+    Undo::Set {
+      parent,
+      key,
+      written,
+      applied,
+      previous,
+    } => {
+      let prop = path_prop(candidate, &parent, &key)?;
+      let values = candidate.get_all(&parent, prop.clone()).map_err(err)?;
+      if values.len() != 1
+        || values[0].1 != written
+        || read_property(candidate, &parent, prop.clone())? != Some(applied.clone())
+      {
+        return Ok(None);
+      }
+      if let Some((previous, previous_id)) = previous {
+        let previous = if candidate.object_type(&previous_id).is_ok() {
+          read_object(candidate, &previous_id)?
+        } else {
+          previous
+        };
+        write_json(candidate, &parent, prop.clone(), &previous, false)?;
+        let next_id = candidate
+          .get(&parent, prop)
+          .map_err(err)?
+          .ok_or("missing inverse value")?
+          .1;
+        record_aliases(candidate, &previous_id, &next_id, aliases)?;
+        Ok(Some(Undo::Set {
+          parent,
+          key,
+          written: next_id,
+          applied: previous,
+          previous: Some((applied, written)),
+        }))
+      } else {
+        candidate.delete(&parent, prop).map_err(err)?;
+        Ok(Some(Undo::Deleted {
+          parent,
+          key,
+          previous: applied,
+          previous_id: written,
+          heads: candidate.get_heads(),
+        }))
+      }
+    }
+    Undo::Deleted {
+      parent,
+      key,
+      previous,
+      previous_id,
+      heads,
+    } => {
+      let prop = path_prop(candidate, &parent, &key)?;
+      if !candidate.get_all(&parent, prop.clone()).map_err(err)?.is_empty() {
+        return Ok(None);
+      }
+      let actor = candidate.get_actor().clone();
+      for change in candidate.get_changes(&heads) {
+        let change = change.decode();
+        if change.actor_id == actor {
+          continue;
+        }
+        for op in change.operations {
+          let encoded = serde_json::to_value(&op).map_err(err)?;
+          if op.obj.to_string() == parent.to_string() && encoded["key"] == key {
+            return Ok(None);
+          }
+        }
+      }
+      let previous = if candidate.object_type(&previous_id).is_ok() {
+        read_object(candidate, &previous_id)?
+      } else {
+        previous
+      };
+      write_json(candidate, &parent, prop.clone(), &previous, false)?;
+      let written = candidate
+        .get(&parent, prop)
+        .map_err(err)?
+        .ok_or("missing restored field")?
+        .1;
+      record_aliases(candidate, &previous_id, &written, aliases)?;
+      Ok(Some(Undo::Set {
         parent,
         key,
         written,
-        applied,
-        previous,
-      } => {
-        // Check the operation identity, not equality: a peer can write the same value.
-        let values = candidate
-          .get_all(&parent, path_prop(&candidate, &parent, &key)?)
-          .map_err(err)?;
-        if values.len() != 1
-          || values[0].1 != written
-          || read_property(&candidate, &parent, path_prop(&candidate, &parent, &key)?)? != Some(applied)
-        {
-          return Ok(false);
-        }
-        if let Some((previous, previous_id)) = previous {
-          // The replaced object may have received hidden peer edits after replacement.
-          let previous = if candidate.object_type(&previous_id).is_ok() {
-            read_object(&candidate, &previous_id)?
-          } else {
-            previous
-          };
-          write_json(
-            &mut candidate,
-            &parent,
-            path_prop(&self.doc, &parent, &key)?,
-            &previous,
-            false,
-          )?;
-        } else {
-          candidate
-            .delete(&parent, path_prop(&candidate, &parent, &key)?)
-            .map_err(err)?;
-        }
-      }
-      Undo::Text {
-        object,
-        inserted,
-        removed,
-        marks,
-        anchor,
-      } => {
-        let mut indices = vec![];
-        for i in 0..candidate.length(&object) {
-          if candidate
-            .get(&object, i)
-            .map_err(err)?
-            .is_some_and(|(_, id)| inserted.contains(&id))
-          {
-            indices.push(i);
+        applied: previous,
+        previous: None,
+      }))
+    }
+    Undo::List {
+      object,
+      inserted,
+      removed,
+      anchor,
+    } => {
+      let mut ranges: Vec<(usize, usize)> = vec![];
+      for i in 0..candidate.length(&object) {
+        let (value, id) = list_value(candidate, &object, i)?;
+        if let Some(applied) = inserted.get(&id) {
+          if applied != &value {
+            return Ok(None);
           }
-        }
-        // Remove only locally inserted operation IDs, leaving interleaved peer characters intact.
-        let mut ranges: Vec<(usize, usize)> = vec![];
-        for i in indices {
           if let Some((start, len)) = ranges.last_mut()
             && *start + *len == i
           {
             *len += 1;
-            continue;
-          }
-          ranges.push((i, 1));
-        }
-        for (start, len) in ranges.into_iter().rev() {
-          candidate.splice_text(&object, start, len as isize, "").map_err(err)?;
-        }
-        if !removed.is_empty() {
-          let index = candidate.get_cursor_position(&object, &anchor, None).map_err(err)?;
-          candidate.splice_text(&object, index, 0, &removed).map_err(err)?;
-          for mut mark in marks {
-            mark.start += index;
-            mark.end += index;
-            candidate.mark(&object, mark, ExpandMark::None).map_err(err)?;
+          } else {
+            ranges.push((i, 1));
           }
         }
       }
+      let mut inverse = vec![];
+      for (start, len) in ranges.into_iter().rev() {
+        let anchor = sequence_cursor(candidate, &object, start + len)?;
+        let removed = (start..start + len)
+          .map(|i| list_value(candidate, &object, i))
+          .collect::<Result<Vec<_>>>()?;
+        candidate
+          .splice(
+            &object,
+            start,
+            len as isize,
+            std::iter::empty::<automerge::hydrate::Value>(),
+          )
+          .map_err(err)?;
+        inverse.push(Undo::List {
+          object: object.clone(),
+          inserted: HashMap::new(),
+          removed,
+          anchor,
+        });
+      }
+      if !removed.is_empty() {
+        let index = candidate.get_cursor_position(&object, &anchor, None).map_err(err)?;
+        let mut inserted = HashMap::new();
+        for (offset, (value, old_id)) in removed.into_iter().enumerate() {
+          let value = if candidate.object_type(&old_id).is_ok() {
+            read_object(candidate, &old_id)?
+          } else {
+            value
+          };
+          write_json(candidate, &object, (index + offset).into(), &value, true)?;
+          let id = candidate
+            .get(&object, index + offset)
+            .map_err(err)?
+            .ok_or("missing restored list value")?
+            .1;
+          record_aliases(candidate, &old_id, &id, aliases)?;
+          inserted.insert(id, value);
+        }
+        inverse.push(Undo::List {
+          object,
+          inserted,
+          removed: vec![],
+          anchor,
+        });
+      }
+      Ok(Some(Undo::Batch(inverse)))
     }
-    candidate.commit();
-    validate(&candidate)?;
-    self.doc = candidate;
-    self.history.pop();
-    Ok(true)
+    Undo::Text {
+      object,
+      inserted,
+      removed,
+      removed_ids,
+      marks,
+      anchor,
+    } => {
+      let mut ranges: Vec<(usize, usize)> = vec![];
+      for i in 0..candidate.length(&object) {
+        if candidate
+          .get(&object, i)
+          .map_err(err)?
+          .is_some_and(|(_, id)| inserted.contains(&id))
+        {
+          if let Some((start, len)) = ranges.last_mut()
+            && *start + *len == i
+          {
+            *len += 1;
+          } else {
+            ranges.push((i, 1));
+          }
+        }
+      }
+      let mut inverse = vec![];
+      for (start, len) in ranges.into_iter().rev() {
+        let units: Vec<_> = candidate.text(&object).map_err(err)?.encode_utf16().collect();
+        let removed = String::from_utf16(&units[start..start + len]).map_err(err)?;
+        let removed_ids = (start..start + len)
+          .map(|i| {
+            candidate
+              .get(&object, i)
+              .map_err(err)?
+              .map(|v| v.1)
+              .ok_or("missing removed character".into())
+          })
+          .collect::<Result<Vec<_>>>()?;
+        let anchor = if start + len == units.len() {
+          candidate
+            .get_cursor(&object, automerge::CursorPosition::End, None)
+            .map_err(err)?
+        } else {
+          candidate.get_cursor(&object, start + len, None).map_err(err)?
+        };
+        let marks = clipped_marks(candidate, &object, start, start + len)?;
+        candidate.splice_text(&object, start, len as isize, "").map_err(err)?;
+        inverse.push(Undo::Text {
+          object: object.clone(),
+          inserted: HashSet::new(),
+          removed,
+          removed_ids,
+          marks,
+          anchor,
+        });
+      }
+      if !removed.is_empty() {
+        let index = candidate.get_cursor_position(&object, &anchor, None).map_err(err)?;
+        let before = text_ids(candidate, &object)?;
+        candidate.splice_text(&object, index, 0, &removed).map_err(err)?;
+        for mut mark in marks {
+          mark.start += index;
+          mark.end += index;
+          candidate.mark(&object, mark, ExpandMark::None).map_err(err)?;
+        }
+        for (offset, old_id) in removed_ids.into_iter().enumerate() {
+          let id = candidate
+            .get(&object, index + offset)
+            .map_err(err)?
+            .ok_or("missing restored character")?
+            .1;
+          aliases.insert(old_id, id);
+        }
+        let inserted = text_ids(candidate, &object)?.difference(&before).cloned().collect();
+        inverse.push(Undo::Text {
+          object,
+          inserted,
+          removed: String::new(),
+          removed_ids: vec![],
+          marks: vec![],
+          anchor,
+        });
+      }
+      Ok(Some(Undo::Batch(inverse)))
+    }
+    Undo::Marks {
+      object,
+      name,
+      previous,
+      heads,
+    } => {
+      // Marks expose values rather than winner operation IDs. Refuse a later write
+      // by a peer to the same mark, even with an equal value. Peer text inserts
+      // are safe: only the character identities present in the original range change.
+      let actor = candidate.get_actor().clone();
+      for change in candidate.get_changes(&heads) {
+        let change = change.decode();
+        if change.actor_id == actor {
+          continue;
+        }
+        for op in change.operations {
+          let encoded = serde_json::to_value(&op).map_err(err)?;
+          if op.obj.to_string() == object.to_string() && encoded["action"] == "markBegin" && encoded["name"] == name {
+            return Ok(None);
+          }
+        }
+      }
+      let values: HashMap<_, _> = previous.into_iter().collect();
+      let mut inverse = vec![];
+      let marks = candidate.marks(&object).map_err(err)?;
+      let mut ranges: Vec<(usize, usize, ScalarValue)> = vec![];
+      for i in 0..candidate.length(&object) {
+        let Some((_, id)) = candidate.get(&object, i).map_err(err)? else {
+          continue;
+        };
+        let Some(value) = values.get(&id) else {
+          continue;
+        };
+        let current = mark_value(&marks, &name, i);
+        inverse.push((id, current));
+        if let Some((_, end, last)) = ranges.last_mut()
+          && *end == i
+          && last == value
+        {
+          *end += 1;
+        } else {
+          ranges.push((i, i + 1, value.clone()));
+        }
+      }
+      for (start, end, value) in ranges {
+        candidate
+          .mark(&object, Mark::new(name.clone(), value, start, end), ExpandMark::None)
+          .map_err(err)?;
+      }
+      Ok(Some(Undo::Marks {
+        object,
+        name,
+        previous: inverse,
+        heads: candidate.get_heads(),
+      }))
+    }
   }
+}
+// Resurrections create fresh operation IDs. Retarget older local history so an
+// insertion followed by a deletion remains undoable after undoing the deletion.
+fn record_aliases(doc: &AutoCommit, old: &ObjId, new: &ObjId, aliases: &mut HashMap<ObjId, ObjId>) -> Result<()> {
+  if old == new {
+    return Ok(());
+  }
+  aliases.insert(old.clone(), new.clone());
+  if let Ok(kind) = doc.object_type(old) {
+    let props: Vec<Prop> = match kind {
+      ObjType::Map | ObjType::Table => doc.keys(old).map(Prop::Map).collect(),
+      ObjType::List | ObjType::Text => (0..doc.length(old)).map(Prop::Seq).collect(),
+    };
+    for prop in props {
+      if let (Some((_, old)), Some((_, new))) = (
+        doc.get(old, prop.clone()).map_err(err)?,
+        doc.get(new, prop).map_err(err)?,
+      ) {
+        record_aliases(doc, &old, &new, aliases)?;
+      }
+    }
+  }
+  Ok(())
+}
+fn rebase_id(id: &mut ObjId, aliases: &HashMap<ObjId, ObjId>) {
+  let mut visited = HashSet::new();
+  while let Some(next) = aliases.get(id) {
+    if !visited.insert(id.clone()) {
+      break;
+    }
+    *id = next.clone();
+  }
+}
+fn rebase_cursor(cursor: &mut Cursor, aliases: &HashMap<ObjId, ObjId>) -> Result<()> {
+  let mut value = cursor.to_string();
+  let mut visited = HashSet::new();
+  while visited.insert(value.clone()) {
+    let next = aliases.iter().find_map(|(old, new)| {
+      if value == old.to_string() {
+        Some(new.to_string())
+      } else if value == format!("-{old}") {
+        Some(format!("-{new}"))
+      } else {
+        None
+      }
+    });
+    let Some(next) = next else {
+      break;
+    };
+    value = next;
+  }
+  *cursor = Cursor::try_from(value).map_err(err)?;
+  Ok(())
+}
+fn rebase_undo(undo: &mut Undo, aliases: &HashMap<ObjId, ObjId>) -> Result<()> {
+  match undo {
+    Undo::Unsupported(_) => {}
+    Undo::Batch(items) => {
+      for item in items {
+        rebase_undo(item, aliases)?;
+      }
+    }
+    Undo::Deleted {
+      parent, previous_id, ..
+    } => {
+      rebase_id(parent, aliases);
+      rebase_id(previous_id, aliases);
+    }
+    Undo::Set {
+      parent,
+      written,
+      previous,
+      ..
+    } => {
+      rebase_id(parent, aliases);
+      rebase_id(written, aliases);
+      if let Some((_, id)) = previous {
+        rebase_id(id, aliases);
+      }
+    }
+    Undo::List {
+      object,
+      inserted,
+      removed,
+      anchor,
+    } => {
+      rebase_id(object, aliases);
+      rebase_cursor(anchor, aliases)?;
+      *inserted = std::mem::take(inserted)
+        .into_iter()
+        .map(|(mut id, value)| {
+          rebase_id(&mut id, aliases);
+          (id, value)
+        })
+        .collect();
+      for (_, id) in removed {
+        rebase_id(id, aliases);
+      }
+    }
+    Undo::Text {
+      object,
+      inserted,
+      removed_ids,
+      anchor,
+      ..
+    } => {
+      rebase_id(object, aliases);
+      rebase_cursor(anchor, aliases)?;
+      *inserted = std::mem::take(inserted)
+        .into_iter()
+        .map(|mut id| {
+          rebase_id(&mut id, aliases);
+          id
+        })
+        .collect();
+      for id in removed_ids {
+        rebase_id(id, aliases);
+      }
+    }
+    Undo::Marks { object, previous, .. } => {
+      rebase_id(object, aliases);
+      for (id, _) in previous {
+        rebase_id(id, aliases);
+      }
+    }
+  }
+  Ok(())
+}
+
+fn sequence_cursor(doc: &AutoCommit, object: &ObjId, index: usize) -> Result<Cursor> {
+  let position = if index == doc.length(object) {
+    automerge::CursorPosition::End
+  } else {
+    index.into()
+  };
+  doc.get_cursor(object, position, None).map_err(err)
+}
+fn list_value(doc: &AutoCommit, object: &ObjId, index: usize) -> Result<(Json, ObjId)> {
+  let value = read_property(doc, object, index.into())?.ok_or("missing list value")?;
+  let id = doc.get(object, index).map_err(err)?.ok_or("missing list identity")?.1;
+  Ok((value, id))
+}
+
+fn text_ids(doc: &AutoCommit, object: &ObjId) -> Result<HashSet<ObjId>> {
+  (0..doc.length(object))
+    .map(|i| {
+      doc
+        .get(object, i)
+        .map_err(err)?
+        .map(|v| v.1)
+        .ok_or("missing character".into())
+    })
+    .collect()
+}
+fn mark_value(marks: &[Mark], name: &str, index: usize) -> ScalarValue {
+  marks
+    .iter()
+    .find(|m| m.name() == name && m.start <= index && index < m.end)
+    .map(|m| m.value().clone())
+    .unwrap_or(ScalarValue::Null)
+}
+fn capture_marks(
+  doc: &AutoCommit,
+  object: &ObjId,
+  name: &str,
+  start: usize,
+  end: usize,
+) -> Result<Vec<(ObjId, ScalarValue)>> {
+  let marks = doc.marks(object).map_err(err)?;
+  (start..end)
+    .map(|i| {
+      Ok((
+        doc.get(object, i).map_err(err)?.ok_or("missing character")?.1,
+        mark_value(&marks, name, i),
+      ))
+    })
+    .collect()
+}
+fn clipped_marks(doc: &AutoCommit, object: &ObjId, start: usize, end: usize) -> Result<Vec<Mark>> {
+  Ok(
+    doc
+      .marks(object)
+      .map_err(err)?
+      .into_iter()
+      .filter_map(|mut mark| {
+        let left = mark.start.max(start);
+        let right = mark.end.min(end);
+        if left >= right {
+          return None;
+        }
+        mark.start = left - start;
+        mark.end = right - start;
+        Some(mark)
+      })
+      .collect(),
+  )
 }
 
 fn utf16_boundary(units: &[u16], i: usize) -> Result<()> {
@@ -1115,7 +1678,7 @@ mod tests {
     assert!(validate_snapshot(&invalid).is_err());
   }
   #[test]
-  fn unsupported_undo_is_explicit() {
+  fn formatting_undo_redo_restores_previous_marks() {
     let mut d = seeded();
     d.apply(Command::MarkText {
       path: path(&["blocks", "text", "props", "text"]),
@@ -1125,7 +1688,13 @@ mod tests {
       value: json!(true),
     })
     .unwrap();
-    assert_eq!(d.undo_local().unwrap_err(), "formatting undo is not implemented");
+    let formatted = d.snapshot_json().unwrap();
+    assert!(d.undo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), fixture());
+    assert!(d.redo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), formatted);
+    assert!(d.undo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), fixture());
   }
   #[test]
   fn deleted_text_undo_restores_original_formatting() {
@@ -1200,12 +1769,8 @@ mod tests {
       text: "LOCAL".into(),
     })
     .unwrap();
-    d.apply(Command::MarkText {
-      path: p,
-      start: 5,
-      end: 10,
-      name: "bold".into(),
-      value: json!(true),
+    d.apply(Command::Delete {
+      path: path(&["metadata", "tags", "0"]),
     })
     .unwrap();
     let checkpoint = d.save();
@@ -1298,6 +1863,14 @@ mod tests {
     })
     .unwrap();
     assert_eq!(d.snapshot_json().unwrap()["blocks"]["new"]["parentId"], json!("text"));
+    let moved = d.snapshot_json().unwrap();
+    assert!(d.undo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap()["blocks"]["new"]["parentId"], json!("root"));
+    assert!(d.undo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), fixture());
+    assert!(d.redo_local().unwrap());
+    assert!(d.redo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), moved);
   }
   #[test]
   fn divergent_tree_merge_rejection_preserves_active_checkpoint() {
@@ -1347,5 +1920,390 @@ mod tests {
     let checkpoint = a.save();
     assert!(a.merge_bytes(&b.save()).is_err());
     assert_eq!(a.save(), checkpoint);
+  }
+  #[test]
+  fn formatting_undo_keeps_peer_insert_and_redo_converges() {
+    let (mut a, mut b) = replicas();
+    let p = path(&["blocks", "text", "props", "text"]);
+    a.apply(Command::MarkText {
+      path: p.clone(),
+      start: 0,
+      end: 5,
+      name: "italic".into(),
+      value: json!(true),
+    })
+    .unwrap();
+    b.apply(Command::SpliceText {
+      path: p,
+      index: 2,
+      delete: 0,
+      text: "PEER".into(),
+    })
+    .unwrap();
+    converge(&mut a, &mut b);
+    assert!(a.undo_local().unwrap());
+    assert_eq!(text(&a), "HePEERllo");
+    let undone = a.snapshot_json().unwrap();
+    assert!(a.redo_local().unwrap());
+    assert_eq!(text(&a), "HePEERllo");
+    assert!(a.undo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap(), undone);
+    converge(&mut a, &mut b);
+  }
+  #[test]
+  fn formatting_undo_refuses_equal_peer_mark_write() {
+    let (mut a, mut b) = replicas();
+    let p = path(&["blocks", "text", "props", "text"]);
+    a.apply(Command::MarkText {
+      path: p.clone(),
+      start: 0,
+      end: 5,
+      name: "italic".into(),
+      value: json!(true),
+    })
+    .unwrap();
+    b.apply(Command::MarkText {
+      path: p,
+      start: 0,
+      end: 5,
+      name: "italic".into(),
+      value: json!(true),
+    })
+    .unwrap();
+    converge(&mut a, &mut b);
+    let before = a.save();
+    assert!(!a.undo_local().unwrap());
+    assert_eq!(a.save(), before);
+  }
+  #[test]
+  fn text_redo_targets_restored_ids_and_preserves_peer_text() {
+    let (mut a, mut b) = replicas();
+    let p = path(&["blocks", "text", "props", "text"]);
+    a.apply(Command::SpliceText {
+      path: p.clone(),
+      index: 1,
+      delete: 3,
+      text: "😀LOCAL".into(),
+    })
+    .unwrap();
+    b.apply(Command::SpliceText {
+      path: p.clone(),
+      index: 2,
+      delete: 0,
+      text: "PEER".into(),
+    })
+    .unwrap();
+    converge(&mut a, &mut b);
+    assert!(a.undo_local().unwrap());
+    let undone = a.snapshot_json().unwrap();
+    assert!(a.redo_local().unwrap());
+    assert!(text(&a).contains("PEER"));
+    assert!(text(&a).contains("😀LOCAL"));
+    assert!(a.undo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap(), undone);
+    converge(&mut a, &mut b);
+  }
+  #[test]
+  fn existing_field_redo_preserves_peer_write_and_new_edit_clears_redo() {
+    let (mut a, mut b) = replicas();
+    a.apply(Command::Set {
+      path: path(&["metadata", "title"]),
+      value: json!("local"),
+    })
+    .unwrap();
+    assert!(a.undo_local().unwrap());
+    b.merge_bytes(&a.save()).unwrap();
+    b.apply(Command::Set {
+      path: path(&["metadata", "title"]),
+      value: json!("peer"),
+    })
+    .unwrap();
+    a.merge_bytes(&b.save()).unwrap();
+    assert!(!a.redo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap()["metadata"]["title"], json!("peer"));
+    a.apply(Command::Set {
+      path: path(&["metadata", "title"]),
+      value: json!("new"),
+    })
+    .unwrap();
+    assert!(!a.redo_local().unwrap());
+  }
+  #[test]
+  fn batch_history_is_atomic_and_roundtrips() {
+    let mut a = seeded();
+    a.apply(Command::Batch {
+      commands: vec![
+        Command::Set {
+          path: path(&["metadata", "title"]),
+          value: json!("local"),
+        },
+        Command::SpliceText {
+          path: path(&["blocks", "text", "props", "text"]),
+          index: 5,
+          delete: 0,
+          text: "!".into(),
+        },
+      ],
+    })
+    .unwrap();
+    let edited = a.snapshot_json().unwrap();
+    assert!(a.undo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap(), fixture());
+    assert!(a.redo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap(), edited);
+    a.apply(Command::Batch {
+      commands: vec![
+        Command::Set {
+          path: path(&["metadata", "title"]),
+          value: json!("another"),
+        },
+        Command::Delete {
+          path: path(&["metadata", "tags", "0"]),
+        },
+      ],
+    })
+    .unwrap();
+    let before = a.save();
+    assert!(a.undo_local().is_err());
+    assert_eq!(a.save(), before);
+  }
+
+  #[test]
+  fn native_cursor_tracks_peer_insert_and_rejects_invalid_offsets() {
+    let (mut a, mut b) = replicas();
+    let p = path(&["blocks", "text", "props", "text"]);
+    let cursor = a.cursor_at(&p, 2).unwrap();
+    b.apply(Command::SpliceText {
+      path: p.clone(),
+      index: 1,
+      delete: 0,
+      text: "😀".into(),
+    })
+    .unwrap();
+    converge(&mut a, &mut b);
+    assert_eq!(a.cursor_position(&p, &cursor).unwrap(), 4);
+    assert!(a.cursor_at(&p, 2).is_err());
+    assert!(a.cursor_at(&p, 99).is_err());
+    assert!(a.cursor_position(&p, "invalid").is_err());
+    let end = a.cursor_at(&p, 7).unwrap();
+    a.apply(Command::SpliceText {
+      path: p.clone(),
+      index: 7,
+      delete: 0,
+      text: "!".into(),
+    })
+    .unwrap();
+    assert_eq!(a.cursor_position(&p, &end).unwrap(), 8);
+  }
+
+  #[test]
+  fn consecutive_local_formatting_undo_redo_is_lifo() {
+    let mut a = seeded();
+    let p = path(&["blocks", "text", "props", "text"]);
+    a.apply(Command::MarkText {
+      path: p.clone(),
+      start: 0,
+      end: 5,
+      name: "bold".into(),
+      value: Json::Null,
+    })
+    .unwrap();
+    a.apply(Command::MarkText {
+      path: p,
+      start: 0,
+      end: 2,
+      name: "bold".into(),
+      value: json!(true),
+    })
+    .unwrap();
+    let edited = a.snapshot_json().unwrap();
+    assert!(a.undo_local().unwrap());
+    assert!(a.undo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap(), fixture());
+    assert!(a.redo_local().unwrap());
+    assert!(a.redo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap(), edited);
+  }
+  #[test]
+  fn added_field_and_deleted_map_undo_redo_preserve_hidden_peer_edits() {
+    let (mut a, mut b) = replicas();
+    a.apply(Command::Set {
+      path: path(&["metadata", "added"]),
+      value: json!({"local":true}),
+    })
+    .unwrap();
+    assert!(a.undo_local().unwrap());
+    assert!(a.redo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap()["metadata"]["added"], json!({"local":true}));
+    a.apply(Command::Delete {
+      path: path(&["metadata", "custom"]),
+    })
+    .unwrap();
+    b.apply(Command::Set {
+      path: path(&["metadata", "custom", "peer"]),
+      value: json!(true),
+    })
+    .unwrap();
+    converge(&mut a, &mut b);
+    assert!(a.undo_local().unwrap());
+    assert_eq!(
+      a.snapshot_json().unwrap()["metadata"]["custom"],
+      json!({"flags":[true,null],"peer":true})
+    );
+    assert!(a.redo_local().unwrap());
+    assert!(a.snapshot_json().unwrap()["metadata"].get("custom").is_none());
+  }
+  #[test]
+  fn deletion_undo_refuses_peer_write_then_delete() {
+    let (mut a, mut b) = replicas();
+    a.apply(Command::Delete {
+      path: path(&["metadata", "custom"]),
+    })
+    .unwrap();
+    b.merge_bytes(&a.save()).unwrap();
+    b.apply(Command::Set {
+      path: path(&["metadata", "custom"]),
+      value: json!({"peer":true}),
+    })
+    .unwrap();
+    b.apply(Command::Delete {
+      path: path(&["metadata", "custom"]),
+    })
+    .unwrap();
+    a.merge_bytes(&b.save()).unwrap();
+    let before = a.save();
+    assert!(!a.undo_local().unwrap());
+    assert_eq!(a.save(), before);
+  }
+  #[test]
+  fn list_undo_redo_preserves_interleaved_peer_insert() {
+    let (mut a, mut b) = replicas();
+    let p = path(&["metadata", "tags"]);
+    a.apply(Command::SpliceList {
+      path: p.clone(),
+      index: 1,
+      delete: 0,
+      values: vec![json!("local1"), json!("local2")],
+    })
+    .unwrap();
+    b.apply(Command::SpliceList {
+      path: p.clone(),
+      index: 1,
+      delete: 0,
+      values: vec![json!("peer")],
+    })
+    .unwrap();
+    converge(&mut a, &mut b);
+    assert!(a.undo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap()["metadata"]["tags"], json!(["one", "peer"]));
+    assert!(a.redo_local().unwrap());
+    assert!(
+      a.snapshot_json().unwrap()["metadata"]["tags"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("peer"))
+    );
+    assert!(a.undo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap()["metadata"]["tags"], json!(["one", "peer"]));
+    converge(&mut a, &mut b);
+  }
+  #[test]
+  fn list_delete_undo_restores_hidden_peer_object_changes() {
+    let mut seed = seeded();
+    seed
+      .apply(Command::SpliceList {
+        path: path(&["metadata", "tags"]),
+        index: 0,
+        delete: 1,
+        values: vec![json!({"local":true})],
+      })
+      .unwrap();
+    let bytes = seed.save();
+    let mut a = DocumentEngine::from_bytes(&bytes, Some("alice")).unwrap();
+    let mut b = DocumentEngine::from_bytes(&bytes, Some("bob")).unwrap();
+    a.apply(Command::SpliceList {
+      path: path(&["metadata", "tags"]),
+      index: 0,
+      delete: 1,
+      values: vec![],
+    })
+    .unwrap();
+    b.apply(Command::Set {
+      path: path(&["metadata", "tags", "0", "peer"]),
+      value: json!(true),
+    })
+    .unwrap();
+    converge(&mut a, &mut b);
+    assert!(a.undo_local().unwrap());
+    assert_eq!(
+      a.snapshot_json().unwrap()["metadata"]["tags"],
+      json!([{"local":true,"peer":true}])
+    );
+    assert!(a.redo_local().unwrap());
+    assert_eq!(a.snapshot_json().unwrap()["metadata"]["tags"], json!([]));
+  }
+  #[test]
+  fn list_insert_undo_refuses_nested_peer_changes() {
+    let (mut a, mut b) = replicas();
+    a.apply(Command::SpliceList {
+      path: path(&["metadata", "tags"]),
+      index: 1,
+      delete: 0,
+      values: vec![json!({"local":true})],
+    })
+    .unwrap();
+    b.merge_bytes(&a.save()).unwrap();
+    b.apply(Command::Set {
+      path: path(&["metadata", "tags", "1", "peer"]),
+      value: json!(true),
+    })
+    .unwrap();
+    a.merge_bytes(&b.save()).unwrap();
+    let before = a.save();
+    assert!(!a.undo_local().unwrap());
+    assert_eq!(a.save(), before);
+  }
+  #[test]
+  fn text_insertion_deletion_history_rebases_resurrected_characters() {
+    let mut d = seeded();
+    let p = path(&["blocks", "text", "props", "text"]);
+    d.apply(Command::SpliceText {
+      path: p.clone(),
+      index: 5,
+      delete: 0,
+      text: "😀LOCAL".into(),
+    })
+    .unwrap();
+    let inserted = d.snapshot_json().unwrap();
+    d.apply(Command::SpliceText {
+      path: p,
+      index: 5,
+      delete: 7,
+      text: String::new(),
+    })
+    .unwrap();
+    assert_eq!(d.snapshot_json().unwrap(), fixture());
+    assert!(d.undo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), inserted);
+    assert!(d.undo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), fixture());
+    assert!(d.redo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), inserted);
+    assert!(d.redo_local().unwrap());
+    assert_eq!(d.snapshot_json().unwrap(), fixture());
+  }
+  #[test]
+  fn native_cursor_survives_deletion_of_its_reference_character() {
+    let mut d = seeded();
+    let p = path(&["blocks", "text", "props", "text"]);
+    let cursor = d.cursor_at(&p, 4).unwrap();
+    d.apply(Command::SpliceText {
+      path: p.clone(),
+      index: 4,
+      delete: 1,
+      text: String::new(),
+    })
+    .unwrap();
+    assert_eq!(d.cursor_position(&p, &cursor).unwrap(), 4);
   }
 }

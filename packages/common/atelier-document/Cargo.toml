@@ -17,3 +17,9 @@ wasm-bindgen = "=0.2.127"
 
 # Automerge uses rand 0.10/getrandom 0.4 on browser WASM.
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+# Automerge 0.11's debug-only fast/slow cursor comparison disagrees on a
+# deleted trailing character. Use its production cursor behavior in local tests;
+# assertions remain enabled for this crate. See the deleted-reference cursor test.
+[profile.dev.package.automerge]
+debug-assertions = false

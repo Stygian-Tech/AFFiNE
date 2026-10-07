@@ -47,8 +47,23 @@ Each simultaneously active replica must have its own actor ID; omitting it gener
 
 - Text undo removes only locally inserted operation IDs, preserving interleaved remote characters. Replaced text is restored using a stable cursor and its original formatting.
 - Field undo checks operation identity and current value before restoring. It refuses conflicting remote field writes or nested edits, rather than overwriting them. Restoring a replaced object includes hidden edits received on the previous object.
-- Formatting, deletion, list and batch undo throw explicit unsupported errors and retain an undo barrier. They never clear older history or skip an unsupported action. No redo API exists yet.
+- `redo()` writes selective inverse operations for text, map fields, map deletion, native list splices, and formatting. A new local command clears redo history; remote synchronization preserves it. Formatting restores only the original character identities, leaving peer inserts alone. Because Automerge exposes mark values without winning operation identities, a later peer write of the same mark name on the same text refuses undo/redo, including equal-value peer writes.
+- `batch` undo/redo is atomic when every child command supports it. Native list inverses remove only original inserted identities and refuse nested peer changes. Direct numeric-path `delete` on a list remains an explicit unsupported barrier; editor list editing uses `spliceList`. Map deletion restores only if the field is still absent and no later peer operation touched that key, including a peer write followed by deletion. History never skips an unsupported or conflicting action.
+- `getCursor(pathJson, index)` and `resolveCursor(pathJson, cursor)` expose native Automerge cursors with UTF-16 offsets. Invalid ranges, surrogate boundaries and malformed cursors are rejected. Automerge 0.11 has a debug-only fast/slow cursor assertion disagreement on a deleted trailing character; this crate disables debug assertions only for that dependency, matching its production release behavior. A regression test covers the returned position after deletion; engine assertions remain enabled.
 - Tree validation requires a present root, reachable blocks, unique child references and matching parent IDs. Atomic `batch` supports block creation/reparenting across intermediate invalid tree states. Conflicting concurrent moves that form cycles or inconsistent trees are explicitly rejected without replacing active state; deterministic repair is not implemented. This prevents claiming the full editor compatibility gate has passed.
 - Database UI, real editor transactions/observers/selections, canvas runtime, and full BlockSuite store integration remain required before migrating live editing away from Yjs.
 
 Validation stages imports, commands, checkpoint merges and sync messages before updating active state. Unsupported or conflicting schema versions, mismatched document identities, invalid trees/block shapes and rich-text errors leave the active checkpoint intact. This boundary is not a security sandbox: authenticated peer admission and resource limits belong in the integration layer.
+
+### Pinned dependency cursor regression
+
+`examples/cursor_repro.rs` reproduces the Automerge 0.11 debug assertion without using the Atelier engine: create native text `Hello`, anchor at index 4, delete the last character, then resolve the cursor. Both movement modes hit `op_set2/op_set.rs:846` when dependency debug assertions are enabled. Production behavior correctly resolves `After` to 4 and `Before` to 3.
+
+```sh
+# Intentionally reproduces the pinned dependency panic.
+cargo --config 'profile.dev.package.automerge.debug-assertions=true' run --manifest-path packages/common/atelier-document/Cargo.toml --example cursor_repro
+cargo --config 'profile.dev.package.automerge.debug-assertions=true' run --manifest-path packages/common/atelier-document/Cargo.toml --example cursor_repro -- before
+# Confirms production native cursor behavior; assertions in the example check offsets.
+cargo run --manifest-path packages/common/atelier-document/Cargo.toml --release --example cursor_repro
+cargo run --manifest-path packages/common/atelier-document/Cargo.toml --release --example cursor_repro -- before
+```
