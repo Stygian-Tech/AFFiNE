@@ -1,0 +1,50 @@
+name: Atelier model compatibility checks
+
+on:
+  push:
+    branches: [feature/atelier-notes-atproto]
+  pull_request:
+    paths:
+      - packages/common/atelier-document/**
+      - packages/frontend/apps/atelier-gate/**
+      - blocksuite/framework/store/src/adapter/engine/**
+      - blocksuite/framework/store/src/__tests__/engine-snapshot.unit.spec.ts
+      - scripts/atelier/**
+      - .github/workflows/atelier-model-gate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  model:
+    if: github.repository == 'Stygian-Tech/AFFiNE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - name: Install workspace dependencies without native application builds
+        run: |
+          corepack enable
+          yarn install --immutable --mode=skip-build
+      - name: Install pinned Rust and WASM tools
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - name: Verify native structured engine
+        run: |
+          cargo fmt --manifest-path packages/common/atelier-document/Cargo.toml --check
+          cargo clippy --locked --manifest-path packages/common/atelier-document/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path packages/common/atelier-document/Cargo.toml
+      - name: Build and verify generated browser bindings
+        run: |
+          yarn atelier:build:wasm
+          yarn vitest run blocksuite/framework/store/src/__tests__/engine-snapshot.unit.spec.ts
+          yarn workspace @affine/atelier-gate test:wasm
+          yarn workspace @affine/atelier-gate build
+      - name: Run model harness browser checks
+        run: |
+          yarn playwright install --with-deps chromium firefox webkit
+          yarn workspace @affine/atelier-gate test

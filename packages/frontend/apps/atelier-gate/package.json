@@ -1,0 +1,23 @@
+{
+  "name": "@affine/atelier-gate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node ../../../../node_modules/.bin/vite --host 127.0.0.1",
+    "build": "node ../../../../node_modules/.bin/tsc --noEmit && node ../../../../node_modules/.bin/vite build",
+    "test": "node ../../../../node_modules/.bin/playwright test",
+    "test:wasm": "node ../../../../node_modules/.bin/tsx tests/wasm.node.ts"
+  },
+  "dependencies": {
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "=1.58.2",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "vite": "^7.3.6"
+  }
+}

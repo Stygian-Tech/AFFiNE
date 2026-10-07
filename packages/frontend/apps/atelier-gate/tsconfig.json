@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "useDefineForClassFields": false,
+    "typeRoots": ["../../../../node_modules/@types", "../../../../tools/@types"]
+  },
+  "include": ["src", "tests", "playwright.config.ts", "vite.config.ts"]
+}
