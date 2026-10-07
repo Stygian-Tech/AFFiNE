@@ -29,7 +29,8 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./test": "./src/test/index.ts"
+    "./test": "./src/test/index.ts",
+    "./engine": "./src/adapter/engine/index.ts"
   },
   "files": [
     "src",
